@@ -16,7 +16,7 @@ func TestStatsSnapshot(t *testing.T) {
 	p.addRx(500)
 	p.markRecv(time.Now())
 	// A confirmed current session makes the peer report Connected.
-	sess := newSession(nil, true, time.Now())
+	sess := newSession(testTransportKeys(0x30), true, time.Now())
 	sess.markConfirmed()
 	p.Promote(sess, true)
 	e.peerTable.AddPeer(p)
@@ -52,7 +52,7 @@ func TestStatsSnapshot(t *testing.T) {
 func TestStatsDisconnectedWhenSilent(t *testing.T) {
 	e := &Engine{peerTable: NewPeerTable()}
 	p := &Peer{PublicKey: []byte{0x01}}
-	sess := newSession(nil, true, time.Now().Add(-10*time.Minute))
+	sess := newSession(testTransportKeys(0x40), true, time.Now().Add(-10*time.Minute))
 	sess.markConfirmed()
 	p.Promote(sess, true)
 	p.markRecv(time.Now().Add(-watchdogTimeout - time.Minute)) // silent

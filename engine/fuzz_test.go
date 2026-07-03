@@ -7,10 +7,10 @@ import (
 	"time"
 
 	"github.com/veil-proto/veil/core"
-	"github.com/veil-proto/veil/transport"
 )
 
-// TestTransportStateMachineFuzzing fuzzes the Transport phase (TagTable and ReplayWindow)
+// TestTransportStateMachineFuzzing fuzzes the record/v1 transport phase
+// (route-token lookup and ReplayWindow)
 // against network anomalies: reorder, loss, duplicates, and cryptographically invalid packets.
 func TestTransportStateMachineFuzzing(t *testing.T) {
 	cPriv, _, _ := core.GenerateElligatorKeypair()
@@ -20,12 +20,13 @@ func TestTransportStateMachineFuzzing(t *testing.T) {
 
 	cliKeys, srvKeys := runHandshake(t, cPriv, sPriv, kNet, nid)
 
-	table := transport.NewTagTable()
+	table := newRouteTokenTable()
 	peer := &Peer{PublicKey: []byte{0xAB}}
 	sess := establishSession(table, peer, srvKeys, false, time.Unix(1000, 0))
 	peer.Promote(sess, true)
+	sendSess := newSession(cliKeys, true, time.Unix(1000, 0))
 
-	const totalPackets = 3000
+	const totalPackets = 4000
 	type testPacket struct {
 		pn    uint64
 		inner []byte
@@ -35,10 +36,7 @@ func TestTransportStateMachineFuzzing(t *testing.T) {
 
 	for pn := uint64(0); pn < totalPackets; pn++ {
 		inner := []byte(fmt.Sprintf("fuzz-payload-%d", pn))
-		wire, err := transport.EncapsulateTransport(cliKeys, pn, inner, 0, 16)
-		if err != nil {
-			t.Fatalf("encap %d: %v", pn, err)
-		}
+		wire := sealTestData(t, sendSess, pn, inner)
 		packets = append(packets, testPacket{pn: pn, inner: inner, wire: wire})
 	}
 
@@ -71,7 +69,7 @@ func TestTransportStateMachineFuzzing(t *testing.T) {
 	}
 
 	// 4. Burst Loss (Skip packets 21 to 520 - 500 packets lost)
-	// TagTable default window is 512, so packet 521 should still be within the precomputed window.
+	// Route-token windows advance by bounded slots, so packet 521 should still be within the admitted window.
 	got, err := deliver(table, packets[521].wire)
 	if err != nil {
 		t.Fatalf("Failed burst loss recovery at packet 521: %v", err)
@@ -95,7 +93,7 @@ func TestTransportStateMachineFuzzing(t *testing.T) {
 	// Since we don't want to generate 8000 packets just for this, we trust the math or write a unit test.
 
 	// 6. Valid Tag, Invalid AEAD
-	// Modifying the MAC of packet 522 should cause DecapsulateTransport to fail,
+	// Modifying the MAC of packet 522 should cause record/v1 open to fail,
 	// and ReplayWindow MUST NOT commit the packet number!
 	badWire := make([]byte, len(packets[522].wire))
 	copy(badWire, packets[522].wire)
@@ -116,21 +114,23 @@ func TestTransportStateMachineFuzzing(t *testing.T) {
 	}
 
 	// 7. Extreme Burst Loss (Desynchronization)
-	// Jump beyond the receive tag window. The exact window is a transport
+	// Jump beyond the receive route-token window. The exact window is a transport
 	// tuning constant; what matters here is that the table is bounded.
-	jump := 522 + 2048 + 1
+	jump := (1 + routeTokenFutureSlots + 1) * routeTokenSlotSpan
 	_, err = deliver(table, packets[jump].wire)
 	if err == nil {
-		t.Fatalf("Expected jump beyond the receive tag window to fail TagTable lookup!")
+		t.Fatalf("Expected jump beyond the receive route-token window to fail lookup!")
 	}
 }
 
-// TestTagTableCollision guarantees that TagTable doesn't panic or incorrectly route
-// when tags naturally collide (which is astronomically unlikely with 16 bytes, but we simulate it).
-func TestTagTableCollision(t *testing.T) {
-	table := transport.NewTagTable()
+// TestRouteTokenTableCollision guarantees that the route-token table doesn't
+// panic or incorrectly route when tokens naturally collide (astronomically
+// unlikely with 16 bytes, but simulated here).
+func TestRouteTokenTableCollision(t *testing.T) {
+	table := newRouteTokenTable()
 
-	fakeTag := bytes.Repeat([]byte{0xAA}, 16)
+	var fakeToken [16]byte
+	copy(fakeToken[:], bytes.Repeat([]byte{0xAA}, 16))
 
 	sess1 := &Session{}
 	sess2 := &Session{}
@@ -138,16 +138,16 @@ func TestTagTableCollision(t *testing.T) {
 	peer2 := &Peer{}
 
 	// Insert first
-	table.AddTag(fakeTag, peer1, sess1, 10)
+	table.add(fakeToken, peer1, sess1)
 
 	// Insert second (collision on same tag)
-	table.AddTag(fakeTag, peer2, sess2, 20)
+	table.add(fakeToken, peer2, sess2)
 
-	lookup, ok := table.Lookup(fakeTag)
+	lookup, ok := table.lookup(fakeToken[:])
 	if !ok {
-		t.Fatalf("Expected tag to be found")
+		t.Fatalf("Expected token to be found")
 	}
-	if lookup.PacketNumber != 20 {
+	if lookup.Peer != peer2 || lookup.Sess != sess2 {
 		t.Fatalf("Expected overwritten entry")
 	}
 }

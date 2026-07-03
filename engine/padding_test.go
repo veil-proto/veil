@@ -2,7 +2,9 @@ package engine
 
 import (
 	"testing"
+	"time"
 
+	recordv1 "github.com/veil-proto/veil/record/v1"
 	"github.com/veil-proto/veil/transport"
 )
 
@@ -12,16 +14,16 @@ import (
 func TestTransportPadLenLightQuantizes(t *testing.T) {
 	for innerLen := 0; innerLen <= maxTransportPlaintext; innerLen++ {
 		pad := int(transportPadLen(innerLen, "light"))
-		total := innerLen + 2 + pad // plaintext = inner + pad_len(2) + pad
+		total := innerLen + pad
 
 		// Never exceed the outer budget.
-		if innerLen+pad+transportOverhead > maxOuterPayload {
+		if innerLen+pad+recordOverhead > maxOuterPayload {
 			t.Fatalf("innerLen=%d pad=%d exceeds maxOuterPayload", innerLen, pad)
 		}
 		// When there is room to reach the next grid line, the padded plaintext
 		// must sit exactly on it; near the ceiling padding is clamped and this
 		// relaxes, which is expected.
-		if innerLen+padQuantum+transportOverhead <= maxOuterPayload {
+		if innerLen+padQuantum+recordOverhead <= maxOuterPayload {
 			if total%padQuantum != 0 {
 				t.Fatalf("innerLen=%d: padded plaintext %d not on %d grid", innerLen, total, padQuantum)
 			}
@@ -63,17 +65,21 @@ func TestTransportPadRoundTrips(t *testing.T) {
 	}
 
 	for _, mode := range []string{"none", "light", "medium", "heavy"} {
-		pad := transportPadLen(len(inner), mode)
-		enc, err := transport.EncapsulateTransport(keys, 0, inner, pad, 16)
+		sendSess := newSession(keys, true, time.Now())
+		recvSess := newSession(keys, false, time.Now())
+		frame := mustMarshalDataFrame(inner)
+		pad := transportPadLen(len(frame), mode)
+		enc, err := sealTransportFrame(sendSess, 0, frame, pad)
 		if err != nil {
 			t.Fatalf("mode %s: encapsulate: %v", mode, err)
 		}
-		out, err := transport.DecapsulateTransport(keys, 0, enc, 16)
+		_, _, out, err := recordv1.Open(recvSess.recvRecordKeys, recvSess.recvReplay, enc)
 		if err != nil {
 			t.Fatalf("mode %s: decapsulate: %v", mode, err)
 		}
-		if string(out) != string(inner) {
-			t.Fatalf("mode %s: round-trip mismatch (len %d vs %d)", mode, len(out), len(inner))
+		res := recvSess.handleRecordFrame(out, time.Now())
+		if string(res.payload) != string(inner) {
+			t.Fatalf("mode %s: round-trip mismatch (len %d vs %d)", mode, len(res.payload), len(inner))
 		}
 	}
 }

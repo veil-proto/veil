@@ -5,6 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	recordv1 "github.com/veil-proto/veil/record/v1"
+	"github.com/veil-proto/veil/tokens"
 	"github.com/veil-proto/veil/transport"
 )
 
@@ -28,10 +30,17 @@ const (
 // session for sending and, briefly after a rekey, a previous session that can
 // still decrypt in-flight packets sent under the old keys.
 type Session struct {
-	keys          *transport.TransportKeys
-	recv          *transport.RecvWindow
-	isInitiator   bool
-	establishedAt time.Time
+	keys            *transport.TransportKeys
+	sendRecordKeys  recordv1.DirectionKeys
+	recvRecordKeys  recordv1.DirectionKeys
+	sendRouteKey    []byte
+	recvRouteKey    []byte
+	sendDirection   tokens.Direction
+	recvDirection   tokens.Direction
+	recvReplay      *recordv1.ReplayWindow
+	recvTokenWindow *routeTokenWindow
+	isInitiator     bool
+	establishedAt   time.Time
 
 	// confirmed is set once we know the peer also holds this session's keys:
 	// true immediately for the initiator (it drove the handshake), and for the
@@ -53,12 +62,21 @@ func newSession(keys *transport.TransportKeys, isInitiator bool, now time.Time, 
 	if len(paddingModes) > 0 {
 		paddingMode = paddingModes[0]
 	}
+	sendKeys, sendRouteKey, sendDir := recordKeys(keys, isInitiator, true)
+	recvKeys, recvRouteKey, recvDir := recordKeys(keys, isInitiator, false)
 	return &Session{
-		keys:          keys,
-		isInitiator:   isInitiator,
-		establishedAt: now,
-		lastSentNano:  now.UnixNano(),
-		paddingMode:   paddingMode,
+		keys:           keys,
+		sendRecordKeys: sendKeys,
+		recvRecordKeys: recvKeys,
+		sendRouteKey:   sendRouteKey,
+		recvRouteKey:   recvRouteKey,
+		sendDirection:  sendDir,
+		recvDirection:  recvDir,
+		recvReplay:     recordv1.NewReplayWindow(),
+		isInitiator:    isInitiator,
+		establishedAt:  now,
+		lastSentNano:   now.UnixNano(),
+		paddingMode:    paddingMode,
 	}
 }
 

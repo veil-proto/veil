@@ -5,20 +5,22 @@ import (
 	"encoding/binary"
 	"testing"
 	"time"
+
+	recordv1 "github.com/veil-proto/veil/record/v1"
 )
 
-// buildFragment constructs one raw VFR1 fragment frame by hand, so tests can
+// buildFragment constructs one raw record/v1 fragment frame by hand, so tests can
 // control offset/total/id precisely (makeTransportFrames always produces
 // full, non-overlapping, in-order coverage — the interesting range-coverage
 // cases need frames it wouldn't naturally emit).
 func buildFragment(id uint32, offset, total uint16, chunk []byte) []byte {
-	frame := make([]byte, fragmentHeaderLen+len(chunk))
-	copy(frame[0:4], fragmentMagic[:])
-	binary.LittleEndian.PutUint32(frame[4:8], id)
-	binary.LittleEndian.PutUint16(frame[8:10], offset)
-	binary.LittleEndian.PutUint16(frame[10:12], total)
-	copy(frame[fragmentHeaderLen:], chunk)
-	return frame
+	body := make([]byte, fragmentHeaderLen+len(chunk))
+	binary.BigEndian.PutUint64(body[0:8], uint64(id))
+	binary.BigEndian.PutUint32(body[8:12], uint32(offset))
+	binary.BigEndian.PutUint32(body[12:16], uint32(total))
+	body[16] = 0
+	copy(body[fragmentHeaderLen:], chunk)
+	return mustMarshalFrame(recordv1.Frame{Type: recordv1.FrameInnerFragment, Body: body})
 }
 
 func TestFragment_RoundTripViaMakeTransportFrames(t *testing.T) {

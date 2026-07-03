@@ -27,8 +27,6 @@ import (
 	"log"
 	"net"
 	"time"
-
-	"github.com/veil-proto/veil/transport"
 )
 
 var (
@@ -37,12 +35,12 @@ var (
 )
 
 const (
-	// floorPlaintext is the frame size every peer starts at and that never
-	// needs probing: 1218 inner bytes encapsulate to a 1280-byte outer IP
-	// packet (1218 + transportOverhead(34) + UDP(8) + IPv4(20) = 1280), the
+	// floorPlaintext is the record/v1 plaintext-frame size every peer starts at and that never
+	// needs probing: 1192 plaintext bytes encapsulate to a 1280-byte outer IPv6
+	// packet (1192 + recordOverhead(40) + UDP(8) + IPv6(40) = 1280), the
 	// smallest MTU every IPv6-capable link (and effectively every IPv4 one)
 	// is guaranteed to carry.
-	floorPlaintext = 1218
+	floorPlaintext = 1192
 
 	probeTimeout = 250 * time.Millisecond
 	probeRetries = 2
@@ -57,7 +55,7 @@ const (
 
 // probeLadder lists candidate frame sizes to try, largest first. Entries at or
 // below floorPlaintext are pointless (already assumed to work) and omitted.
-var probeLadder = []int{maxTransportPlaintext, 1358, 1298, 1258}
+var probeLadder = []int{maxTransportPlaintext, 1352, 1292, 1252}
 
 // launchMTUUpdate runs updateMTU in the background under the peer's single
 // probe slot, dropping the request if a probe is already in flight (the shared
@@ -139,11 +137,11 @@ func (e *Engine) probeSize(peer *Peer, size int) bool {
 
 	for attempt := 0; attempt <= probeRetries; attempt++ {
 		ch := peer.armProbe(size)
-		enc, err := transport.EncapsulateTransport(sess.keys, sess.nextPN(), inner, 0, 16)
-		if err != nil {
+		padLen := size - frameOverhead - len(inner)
+		if padLen < 0 {
 			return false
 		}
-		if _, err := e.conn.writeTo(enc, ep, localIP); err != nil {
+		if err := sendControlOnSession(e.conn, sess, ep, localIP, inner, uint16(padLen)); err != nil {
 			return false
 		}
 		select {
@@ -166,11 +164,7 @@ func (e *Engine) handleMTUProbe(payload []byte, sess *Session, remote *net.UDPAd
 	copy(ack[:4], probeAckMagic[:])
 	binary.LittleEndian.PutUint16(ack[4:6], size)
 
-	enc, err := transport.EncapsulateTransport(sess.keys, sess.nextPN(), ack[:], 0, 16)
-	if err != nil {
-		return
-	}
-	if _, err := e.conn.writeTo(enc, remote, localIP); err != nil {
+	if err := sendControlOnSession(e.conn, sess, remote, localIP, ack[:], 0); err != nil {
 		log.Printf("MTU probe ack send error: %v", err)
 	}
 }

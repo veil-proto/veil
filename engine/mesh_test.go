@@ -11,7 +11,7 @@ import (
 
 // TestMeshIntro_RoundTrip verifies encodeMeshIntro/decodeMeshIntro reproduce
 // the same peer pubkey, endpoint, AllowedIPs and window across the wire,
-// mirroring fragment_test.go's round-trip style for VFR1.
+// mirroring the direct encode/decode tests for other control payloads.
 func TestMeshIntro_RoundTrip(t *testing.T) {
 	pub := bytes.Repeat([]byte{0xAB}, 32)
 	addr := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 51820}
@@ -173,7 +173,7 @@ func TestMeshIntro_DecodeRejectsOversizedAllowedIPCount(t *testing.T) {
 }
 
 // TestMeshIntro_DecodeRejectsBadMagic verifies a frame with the right shape
-// but wrong magic is rejected (so it isn't confused with VFR1/VPR1/VPA1).
+// but wrong magic is rejected.
 func TestMeshIntro_DecodeRejectsBadMagic(t *testing.T) {
 	pub := bytes.Repeat([]byte{0x55}, 32)
 	addr := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 6), Port: 4004}
@@ -181,7 +181,7 @@ func TestMeshIntro_DecodeRejectsBadMagic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeMeshIntro: %v", err)
 	}
-	copy(frame[0:4], fragmentMagic[:])
+	copy(frame[0:4], []byte{'F', 'R', 'A', 'G'})
 	if _, err := decodeMeshIntro(frame); err == nil {
 		t.Fatal("expected decode error for non-MESH_INTRO magic")
 	}

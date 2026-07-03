@@ -170,7 +170,7 @@ func (p *Peer) Current() *Session {
 
 // Promote installs sess as the current session. The old current becomes the
 // previous (grace) session; any older previous is torn down first, evicting its
-// tags from the shared table. confirmed marks whether the peer is already known
+// route tokens from the shared table. confirmed marks whether the peer is already known
 // to hold sess's keys (true for the initiator; false for the responder until it
 // receives data on the session).
 func (p *Peer) Promote(sess *Session, confirmed bool) {
@@ -179,8 +179,8 @@ func (p *Peer) Promote(sess *Session, confirmed bool) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.previous != nil && p.previous.recv != nil {
-		p.previous.recv.Teardown()
+	if p.previous != nil && p.previous.recvTokenWindow != nil {
+		p.previous.recvTokenWindow.Teardown()
 	}
 	p.previous = p.current
 	p.current = sess
@@ -217,13 +217,13 @@ func (p *Peer) Pending() (*core.HandshakeMachine, time.Time) {
 }
 
 // ExpirePrevious tears down the previous session if it is older than
-// rejectAfterTime, so its tags stop consuming table space.
+// rejectAfterTime, so its route tokens stop consuming table space.
 func (p *Peer) ExpirePrevious(now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.previous != nil && now.Sub(p.previous.establishedAt) > rejectAfterTime {
-		if p.previous.recv != nil {
-			p.previous.recv.Teardown()
+		if p.previous.recvTokenWindow != nil {
+			p.previous.recvTokenWindow.Teardown()
 		}
 		p.previous = nil
 	}

@@ -7,7 +7,7 @@ package engine
 // the real adaptation to a path's actual MTU happens per peer, below this
 // ceiling, via active probing (pmtu.go) rather than by asking the user to
 // guess a static interface MTU.
-const DefaultTunMTU = 1418
+const DefaultTunMTU = maxTransportPlaintext
 
 // tunWriteOffset is the headroom kept in front of every packet handed to
 // WriteBatch. Decapsulated packets start tagLen (16) bytes into their UDP read

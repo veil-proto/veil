@@ -1,31 +1,30 @@
 # VEIL-PQ-1
 
-**Status:** DRAFT (target/v1). **NOT IMPLEMENTED** — no PQ code exists
-anywhere in any of the 5 repos today.
+**Status:** DRAFT. Go reference helpers exist in `pq/`; runtime handshake
+integration is still pending.
 
-Source: `VEIL_FINAL_DEVELOPMENT_SPEC.md` §8.
+Source: `VEIL_FINAL_DEVELOPMENT_SPEC.md` section 8.
 
-## Target (v1) scheme
+## Scheme
 
-Default: classical ephemeral key exchange + ML-KEM-768, used only for key
-establishment/refresh, never per data packet. Three policy modes:
-`PQ_REQUIRED` (no user IP frame before hybrid confirmation — hard invariant),
-`PQ_PREFERRED` (attempt hybrid, fallback only if explicitly configured and
-suite-bound), `CLASSIC_ONLY` (explicit legacy/dev mode, never a silent
-fallback). PQ material carried inside encrypted control capsules, fragmented
-across records as needed. Refresh via
-`CONTROL_PQ_REFRESH_OFFER/ANSWER/CONFIRM`, folding
+Default target: classical ephemeral key exchange plus ML-KEM-768 for key
+establishment and refresh, never per data packet.
+
+Policy modes:
+
+- `PQ_REQUIRED`: no user IP frame before hybrid confirmation.
+- `PQ_PREFERRED`: attempt hybrid; fallback only if explicitly configured and
+  suite-bound.
+- `CLASSIC_ONLY`: explicit legacy/dev mode, never silent fallback.
+
+PQ material is carried inside encrypted control capsules. Refresh uses
+`CONTROL_PQ_REFRESH_OFFER/ANSWER/CONFIRM` and folds
 `pq_refresh_secret = H(mlkem_shared_secret || refresh_transcript_hash)` into
 the next epoch root.
 
-## v0 (current prototype) — what actually runs today
+## Go Runtime State
 
-Nothing. v0's handshake (`core/handshake_machine.go`) is purely classical
-X25519 — `dh_es`, `dh_ee`, `dh_se`, `dh_static` — with no KEM term, no PQ
-policy field, and no fallback/downgrade logic since there is nothing to
-downgrade from. `go.mod` has no ML-KEM or post-quantum dependency.
-
-This is squarely Phase 5 work (`docs/ROADMAP.md`), gated on `VEIL-CANON-1`
-(to carry variable-length ML-KEM public keys/ciphertexts) and
-`VEIL-CONTROL-1` (to carry the PQ offer/answer/confirm exchange) landing
-first. Not started, no ETA.
+`pq/` contains ML-KEM-768 encapsulation/decapsulation wrappers, policy-gate
+helpers, and refresh-secret derivation tests. The production handshake still
+uses the current classical path until the PQ control exchange and config/API
+gate are wired.

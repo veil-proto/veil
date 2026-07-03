@@ -13,15 +13,12 @@ import (
 	"time"
 
 	"github.com/veil-proto/veil/config"
-	"github.com/veil-proto/veil/transport"
 
 	"golang.org/x/crypto/curve25519"
 )
 
-// meshIntroMagic identifies a MESH_INTRO frame, following the same
-// magic-prefix-sniff convention as fragmentMagic (VFR1) and probeMagic/
-// probeAckMagic (VPR1/VPA1) — see VEIL-MESH-1.md §3.1 for why this frame
-// doesn't retrofit a general frame_type byte instead.
+// meshIntroMagic identifies a compact MESH_INTRO control payload carried
+// inside a record/v1 CONTROL inner frame.
 var meshIntroMagic = [4]byte{'V', 'M', 'I', '1'}
 
 const (
@@ -143,8 +140,7 @@ func encodeMeshIntro(pubKey []byte, addr *net.UDPAddr, allowedIPs []string, wind
 	return frame, nil
 }
 
-// looksLikeMeshIntro reports whether frame carries the MESH_INTRO magic
-// prefix, the same sniff-a-magic-prefix check used for VFR1/VPR1/VPA1.
+// looksLikeMeshIntro reports whether a CONTROL payload carries MESH_INTRO.
 func looksLikeMeshIntro(frame []byte) bool {
 	return len(frame) >= 4 && string(frame[0:4]) == string(meshIntroMagic[:])
 }
@@ -235,12 +231,7 @@ func (e *Engine) sendMeshIntro(dst *Peer, introPubKey []byte, introAddr *net.UDP
 	if err != nil {
 		return err
 	}
-	enc, err := transport.EncapsulateTransport(sess.keys, sess.nextPN(), frame, 0, 16)
-	if err != nil {
-		return err
-	}
-	_, err = e.conn.writeTo(enc, ep, localIP)
-	return err
+	return sendControlOnSession(e.conn, sess, ep, localIP, frame, 0)
 }
 
 // handleMeshIntro processes an inbound MESH_INTRO: it registers the
@@ -364,7 +355,7 @@ func (e *Engine) relayToPeer(target *Peer, inner []byte) {
 // single-frame send path sendOnSession already uses per-frame internally.
 func transportSend(conn *udpConn, sess *Session, ep *net.UDPAddr, localIP net.IP, frame []byte) error {
 	pn := sess.nextPN()
-	enc, err := transport.EncapsulateTransport(sess.keys, pn, frame, transportPadLen(len(frame), sess.paddingMode), 16)
+	enc, err := sealTransportFrame(sess, pn, frame, transportPadLen(len(frame), sess.paddingMode))
 	if err != nil {
 		return err
 	}

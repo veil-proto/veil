@@ -13,14 +13,14 @@ func TestSeamlessRekeySendSession(t *testing.T) {
 	peer := &Peer{PublicKey: []byte{0x01}}
 	now := time.Unix(1000, 0)
 
-	a := newSession(nil, true, now)
+	a := newSession(testTransportKeys(0x10), true, now)
 	peer.Promote(a, true) // initial session, confirmed
 	if peer.SendSession() != a {
 		t.Fatal("initial: SendSession should be the confirmed current session A")
 	}
 
 	// Responder-style rekey: B becomes current but is not yet confirmed.
-	b := newSession(nil, false, now)
+	b := newSession(testTransportKeys(0x20), false, now)
 	peer.Promote(b, false)
 	if peer.Current() != b || peer.previous != a {
 		t.Fatal("promotion did not set current=B, previous=A")

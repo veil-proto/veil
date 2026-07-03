@@ -1,8 +1,8 @@
 # VEIL Roadmap
 
 **Status:** living document, updated as phases close.
-**Last updated:** 2026-07-03 (Phase 1 P0 fixes + Phase 2 GUI overhaul and mesh
-milestone-1 landed).
+**Last updated:** 2026-07-04 (Go data plane switched to `record/v1`; Phase 2
+GUI/mesh milestone-1 retained).
 **Scope:** all five repos — `veil` (protocol core), `veil-install`, `veil-linux`,
 `veil-windows`, `veil-windows-gui`.
 
@@ -28,8 +28,8 @@ deliberate decision.
 | `go build`/`go vet` (veil-windows, veil-windows-gui, cross-compiled) | green |
 | Phase 1 P0 fixes (§2 below) | **done** — config validation, PSK wired into KDF, fragment range-coverage, engine lifecycle + dynamic AddPeer/RemovePeer, PersistentKeepalive wired in, rate-limited hostile-input logging, DH zero-output abort, secret zeroization |
 | Handshake | 2-message WireGuard-Noise-style, Elligator2-encoded ephemerals — **not** the target's TLV/canonical + ML-KEM hybrid scheme |
-| Wire record | 16-byte cleartext BLAKE2s tag + AEAD ciphertext — **not** the target's route-token + header-protected sequence |
-| PQ / kmod / XDP | not started, no code exists anywhere in any of the 5 repos |
+| Wire record | Go engine uses `record/v1`: `route_token[16] || seq_protected[8] || AEAD`, v1 inner frames, bounded route-token window, RFC-6479 replay commit after AEAD success. `transport/v0` remains as a legacy package/test reference, not the runtime data plane. |
+| PQ / kmod / XDP | PQ reference code exists in `pq/` using Go's ML-KEM-768 primitives. kmod/XDP not started; no C/kernel code exists anywhere in any of the 5 repos. |
 | Mesh | Phase 2 milestone-1 **done**: `VEIL-MESH-1.md` design doc, `MESH_INTRO` frame, bounded UDP hole-punch, hub relay fallback gated to `Engine.IsHub()`, all unit-tested. Deferred: full ICE/TURN, multi-hop relay, route gossip, the leaf-side "trusted introducer" hardening noted in `VEIL-MESH-1.md` §3.2, and the config-schema question (§9 below, §7 of the doc) |
 | GUI | Phase 2 **done**: resizable window, real log streaming (`CmdLogs` + ring buffer), structured Split Tunnel tab with Allowed/Disallowed CIDR editing (client-side subtraction), `config.Serialize()` added to support it. Raw `.conf` editor kept as "Advanced" (§10 below) |
 
@@ -38,13 +38,14 @@ deliberate decision.
 ## 1. Phase 0 — Baseline and freeze
 
 - Current behavior is the reference point: `go test ./...` passes cleanly in
-  `veil` as of this writing. Treat this as `transport/v0` for any future
-  A/B benchmark against `record/v1` (spec §19 Phase 3).
+  `veil` with the Go runtime data plane on `record/v1`. The old
+  `transport/v0` package is retained for legacy comparisons/tests, not used
+  by `engine` for production records.
 - No benchmark harness exists yet in `engine/` beyond the functional test
   suite (`parallel_test.go`, `rekey_test.go`, `padding_test.go`,
   `watchdog_test.go`, `fuzz_test.go`). Adding a dedicated throughput/latency
-  benchmark harness is deferred to when `record/v1` work actually starts
-  (Phase 3 below) — no value in benchmarking today's format in isolation.
+  benchmark harness is still deferred; add it before any kmod/XDP split so the
+  Go and kernel data planes can be compared against the same traffic profile.
 
 ## 2. Phase 1 — P0 correctness fixes (done)
 
@@ -90,45 +91,58 @@ Write and lock initial drafts (see `docs/spec/`, already scaffolded as part of
 this roadmap):
 
 ```
-VEIL-CANON-1.md       — DRAFT, not implemented (no TLV encoder exists in core/)
-VEIL-KDF-1.md         — DRAFT, v0 appendix documents today's HKDF-BLAKE2s chain
-VEIL-TOKENS-1.md      — DRAFT, v0 appendix documents today's BLAKE2s tag lookup
-VEIL-RECORD-1.md      — DRAFT, v0 appendix documents today's tag+AEAD wire format
-VEIL-CONTROL-1.md     — DRAFT, not implemented (rekey/PMTU are hand-coded into engine.go)
-VEIL-PQ-1.md          — DRAFT, not implemented
+VEIL-CANON-1.md       — DRAFT, Go package exists in canon/
+VEIL-KDF-1.md         — DRAFT, Go package exists in kdf/; runtime handshake still uses the current core KDF bridge
+VEIL-TOKENS-1.md      — DRAFT, Go package exists in tokens/ and powers route tokens in engine/
+VEIL-RECORD-1.md      — DRAFT, Go package exists in record/v1 and is used by engine/
+VEIL-CONTROL-1.md     — DRAFT, control/v1 package exists; PMTU and MESH_INTRO ride record/v1 control frames
+VEIL-PQ-1.md          — DRAFT, pq/ package exists; handshake integration/config gate still pending
 VEIL-KMOD-1.md        — DRAFT, not implemented
 VEIL-INVARIANTS-1.md  — DRAFT, includes v0-compliance checklist
 ```
 
 Deterministic test vectors (transcript hash, KDF chain, epoch key outputs,
 route token outputs, header protection outputs, record seal/open) are
-target-spec (v1) work and depend on Phase 3 (`record/v1`) existing first —
-not started.
+target-spec (v1) work. Package-level unit vectors exist for the new Go
+packages; publish stable cross-language fixture files before starting kmod.
 
 ## 4. Phase 3 — Go `record/v1`
 
-Not started. Depends on Phase 2 vectors. Keep `transport/v0` available for
-A/B benchmarking per spec §19.
+Runtime switch done in Go:
+
+- Outer records are now `route_token[16] || seq_protected[8] || AEAD`.
+- Header protection, nonce derivation, AEAD associated data, and replay live
+  in `record/v1`.
+- `engine` uses a bounded receive route-token table/window instead of
+  `transport.TagTable`.
+- Inner payloads are typed v1 frames (`DATA_IP4`, `DATA_IP6`, `CONTROL`,
+  `INNER_FRAGMENT`, `PAD_ONLY`).
+- `transport/v0` remains available only as legacy code and a comparison point.
 
 ## 5. Phase 4 — Encrypted control frames
 
-Not started. Note: the mesh workstream (§9 below) needs a narrow slice of
-this (a single new frame type, `MESH_INTRO`) without waiting for the full
-control-frame redesign — see `VEIL-MESH-1.md`.
+Data-plane carrier done: PMTU probe/ack and `MESH_INTRO` are encrypted inside
+record/v1 `CONTROL` frames. The `control/v1` TLV capsule helpers exist, but
+the daemon/API-level control protocol is still the existing repo-specific
+surface.
 
 ## 6. Phase 5 — PQ initial hybrid
 
-Not started. ML-KEM-768, strict `PQ_REQUIRED` gate. No code exists.
+Reference Go package started in `pq/` with ML-KEM-768 encapsulation,
+decapsulation, gate checks, and refresh helpers. Runtime handshake integration
+and config/API knobs for strict `PQ_REQUIRED` are still pending.
 
 ## 7. Phase 6 — Epoch ratchet and token ladder
 
-Not started.
+Reference Go packages exist in `epoch/` and `tokens/`; route-token derivation
+is wired into the Go engine. Full runtime epoch ratchet/refresh policy is still
+pending.
 
 ## 8. Phase 7 — Fuzzing and invariant tests
 
-Partially started: `engine/fuzz_test.go` exists today (fragment/packet
-fuzzing against the *current* v0 format). Canonical-parser and Netlink
-fuzzers are v1/kmod-era work, not started.
+Partially started: `engine/fuzz_test.go` now exercises the record/v1 transport
+path (route-token lookup, replay, reordering, loss, duplicate rejection, AEAD
+failure). Canonical-parser and Netlink fuzzers are kmod-era work, not started.
 
 ## 9. Mesh workstream (new — not in the original spec) — milestone-1 done
 
@@ -198,8 +212,10 @@ visibly synchronized with the rest of the project. All landed:
 
 ## 11. Phases 8-11 — `veild` split, `veil.ko` MVP, XDP prefilter, throughput
 
-Not started, no ETA. These depend on Phases 3-7 landing first. No C/kernel
-code exists in any of the 5 repos today.
+Not started, no ETA. The Go data plane is now on the target record format,
+but kmod/XDP still need stable fixture vectors, the runtime PQ gate, and the
+epoch refresh policy finalized first. No C/kernel code exists in any of the 5
+repos today.
 
 ---
 
@@ -215,8 +231,9 @@ the authoritative list of what moves together.
 | PSK wired into real KDF | Yes (configs with PSK set now handshake differently; PSK-less configs unaffected) | none | none | none | none |
 | `Engine.Run(ctx, errChan)` signature change + `Close()`/`Wait()` | Yes | `cmd/veil-daemon/main.go` call site + shutdown path | `cmd/veil-client/main.go` call site + shutdown path; `wintunnel/tunnel.go` `Connect`/`stopLocked` | none (doesn't call Engine directly) | none |
 | `Engine.AddPeer`/`RemovePeer` runtime API added | No (additive) | none required yet | none required yet | none required yet (consumed later by mesh work) | none |
-| Fragmentation range-coverage fix | No (same VFR1 wire format, stricter acceptance) | none | none | none | none |
+| Fragmentation range-coverage fix | No (stricter acceptance; now carried as record/v1 `INNER_FRAGMENT`) | none | none | none | none |
 | `PersistentKeepalive` wired in | No (same config field, now honored) | none | none | none | none |
+| Go data plane switched to `record/v1` | Yes (wire-format change) | bump `github.com/veil-proto/veil` and rebuild daemon | bump `github.com/veil-proto/veil` and rebuild client/service | bump `veil`/`veil-windows` module pins and rebuild GUI/service | bump `github.com/veil-proto/veil`; tooling must emit configs compatible with the new runtime |
 | `config.Serialize()` writer added | No (additive) | none required | none required | consumed by the Split Tunnel tab (done) | optional future use |
 | `CmdLogs` control-protocol command + `LogBuffer` | No (additive) | n/a (Linux daemon has no GUI/control pipe) | `control/{proto,client,server}.go`, `wintunnel/tunnel.go` (`Logs` on `Handler`) | `cmd/veil-service/handler_windows.go` wires the ring buffer; GUI Logs tab consumes it | none |
 | `MESH_INTRO` frame + `Engine.IsHub()`/hub relay | No (additive, opt-in via `EnableMeshHub()`) | none required yet — no daemon call site enables hub mode | none required yet | none required yet | none |
@@ -226,11 +243,11 @@ the authoritative list of what moves together.
 
 ## 13. Immediate next steps
 
-1. Land Phase 1 (P0 fixes) in `veil`, with the small lockstep edits in
-   `veil-linux`/`veil-windows`/`veil-install` listed in the sync matrix.
-2. Once `config.Validate()`/`Serialize()` and `Engine.Close()`/`Wait()`/
-   `AddPeer()`/`RemovePeer()` are frozen, GUI work (§10) and mesh design +
-   milestone-1 (§9) proceed in parallel — they touch disjoint files except
-   both want `config/config.go`, sequenced to avoid conflicts.
-3. Only after Phase 1 fixes, Phase 2 spec vectors, and fuzzing exist: start
-   the `veild`/`veil.ko` split (Phase 8+).
+1. Sync all downstream repos to the new `github.com/veil-proto/veil@main`
+   pseudo-version and keep the cross-repo test/build matrix green.
+2. Publish stable v1 fixture files for canon/KDF/tokens/record/control/PQ so
+   Go, future C/kmod, and any Rust test harness all prove byte-for-byte
+   compatibility before kernel work starts.
+3. Wire the runtime PQ gate and epoch refresh policy into the Go handshake.
+4. Start the `veild`/`veil.ko` split only after the Go runtime remains green on
+   the target data-plane format.

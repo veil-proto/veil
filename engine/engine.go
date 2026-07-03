@@ -23,6 +23,7 @@ import (
 	"github.com/veil-proto/veil/config"
 	"github.com/veil-proto/veil/core"
 	"github.com/veil-proto/veil/internal/ratelog"
+	recordv1 "github.com/veil-proto/veil/record/v1"
 	"github.com/veil-proto/veil/transport"
 )
 
@@ -148,8 +149,8 @@ func padHandshake(pkt []byte) []byte {
 // handful of bucket sizes instead of the exact plaintext size leaking through.
 const padQuantum = 128
 
-// transportPadLen calculates data-plane padding without exceeding the outer UDP
-// payload budget used by the fragmentation layer.
+// transportPadLen calculates record/v1 inner-frame padding without exceeding
+// the outer UDP payload budget used by the fragmentation layer.
 //
 //   - "none" (and legacy empty): no padding — the frame's size still directly
 //     reveals the inner packet size. Only for benchmarking / debugging.
@@ -170,10 +171,10 @@ func transportPadLen(innerLen int, modes ...string) uint16 {
 		return 0
 	}
 
-	// plaintextLen is what DecapsulateTransport measures the padding against:
-	// the inner packet plus the 2-byte pad_len trailer. Quantize that so the
-	// observable ciphertext length lands on a fixed grid.
-	plaintextLen := innerLen + 2
+	// innerLen already includes the record/v1 inner frame header and pad_len
+	// trailer. Quantize that so the observable ciphertext length lands on a
+	// fixed grid.
+	plaintextLen := innerLen
 	pad := 0
 	if rem := plaintextLen % padQuantum; rem != 0 {
 		pad = padQuantum - rem
@@ -182,7 +183,7 @@ func transportPadLen(innerLen int, modes ...string) uint16 {
 		pad += randUint(padQuantum)
 	}
 
-	maxPad := maxOuterPayload - transportOverhead - innerLen
+	maxPad := maxTransportPlaintext - innerLen
 	if maxPad <= 0 {
 		return 0
 	}
@@ -194,20 +195,20 @@ func transportPadLen(innerLen int, modes ...string) uint16 {
 
 // ---- session helpers ----
 
-func establishSession(tagTable *transport.TagTable, peer *Peer, keys *transport.TransportKeys, isInitiator bool, now time.Time) *Session {
+func establishSession(routeTokens *routeTokenTable, peer *Peer, keys *transport.TransportKeys, isInitiator bool, now time.Time) *Session {
 	paddingMode := "light"
 	if peer.IfaceCfg != nil {
 		paddingMode = peer.IfaceCfg.Padding
 	}
 	sess := newSession(keys, isInitiator, now, paddingMode)
-	sess.recv = transport.NewRecvWindow(peer, sess, keys, tagTable)
+	sess.recvTokenWindow = newRouteTokenWindow(routeTokens, peer, sess, sess.recvRouteKey, sess.recvDirection)
 	return sess
 }
 
 func sendOnSession(conn *udpConn, endpoint *net.UDPAddr, localIP net.IP, peer *Peer, sess *Session, inner []byte) error {
 	for _, frame := range makeTransportFrames(inner, peer.FrameBudget()) {
 		pn := sess.nextPN()
-		enc, err := transport.EncapsulateTransport(sess.keys, pn, frame, transportPadLen(len(frame), sess.paddingMode), 16)
+		enc, err := sealTransportFrame(sess, pn, frame, transportPadLen(len(frame), sess.paddingMode))
 		if err != nil {
 			return err
 		}
@@ -217,6 +218,51 @@ func sendOnSession(conn *udpConn, endpoint *net.UDPAddr, localIP net.IP, peer *P
 		sess.markSent(time.Now())
 	}
 	return nil
+}
+
+func sealTransportFrame(sess *Session, pn uint64, frame []byte, padLen uint16) ([]byte, error) {
+	plaintext := marshalFrameWithPadding(frame, padLen)
+	routeToken := routeTokenForSend(sess, pn)
+	return recordv1.Seal(sess.sendRecordKeys, routeToken, pn, plaintext)
+}
+
+func marshalControlFrame(body []byte, padLen uint16) ([]byte, error) {
+	return recordv1.MarshalFrame(recordv1.Frame{
+		Type:    recordv1.FrameControl,
+		Body:    body,
+		Padding: make([]byte, int(padLen)),
+	})
+}
+
+func sendControlOnSession(conn *udpConn, sess *Session, ep *net.UDPAddr, localIP net.IP, body []byte, padLen uint16) error {
+	frame, err := marshalControlFrame(body, padLen)
+	if err != nil {
+		return err
+	}
+	pn := sess.nextPN()
+	enc, err := sealTransportFrame(sess, pn, frame, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := conn.writeTo(enc, ep, localIP); err != nil {
+		return err
+	}
+	sess.markSent(time.Now())
+	return nil
+}
+
+func (e *Engine) handleControlPayload(payload []byte, sess *Session, peer *Peer, remote *net.UDPAddr, localIP net.IP) {
+	if len(payload) < 4 {
+		return
+	}
+	switch string(payload[:4]) {
+	case string(probeMagic[:]):
+		e.handleMTUProbe(payload, sess, remote, localIP)
+	case string(probeAckMagic[:]):
+		handleMTUProbeAck(payload, peer)
+	case string(meshIntroMagic[:]):
+		e.handleMeshIntro(payload)
+	}
 }
 
 // keepaliveInterval returns the jittered keepalive period for peer: its
@@ -240,7 +286,7 @@ type Engine struct {
 	conn         *udpConn
 	peerTable    *PeerTable
 	routingTable *RoutingTable
-	tagTable     *transport.TagTable
+	routeTokens  *routeTokenTable
 	localPriv    [32]byte
 
 	// isHub marks this Engine as mesh-hub-capable: willing to relay data
@@ -277,7 +323,7 @@ func New(cfg *config.Config, tunDev Tun, conn *net.UDPConn) (*Engine, error) {
 		conn:         newUDPConn(conn),
 		peerTable:    NewPeerTable(),
 		routingTable: NewRoutingTable(),
-		tagTable:     transport.NewTagTable(),
+		routeTokens:  newRouteTokenTable(),
 	}
 	copy(e.localPriv[:], cfg.Interface.PrivateKey)
 
@@ -531,7 +577,7 @@ func (b *udpWriteBatch) flush() {
 	n := b.n
 	parallelRange(n, func(i int) {
 		j := &b.jobs[i]
-		enc, err := transport.EncapsulateTransportInto(b.bufs[i], j.sess.keys, j.pn, j.frame, j.padLen, 16)
+		enc, err := sealTransportFrame(j.sess, j.pn, j.frame, j.padLen)
 		if err != nil {
 			log.Printf("encapsulate error: %v", err)
 			b.pkts[i] = nil
@@ -650,9 +696,9 @@ type udpDecryptJob struct {
 	i      int
 	sess   *Session
 	peer   *Peer
-	pn     uint64
 	packet []byte
 	out    []byte
+	seq    uint64
 	failed bool
 }
 
@@ -673,7 +719,7 @@ func (e *Engine) udpToTun(errChan chan error) {
 	readErrs := 0
 
 	debugTiming := os.Getenv("VEIL_DEBUG_TIMING") != ""
-	var okCount, tagMiss, precheckFail, decryptFail, commitFail int
+	var okCount, tokenMiss, decryptFail int
 	lastReport := time.Now()
 
 	for {
@@ -712,32 +758,24 @@ func (e *Engine) udpToTun(errChan chan error) {
 		// becomes a job waiting on the one genuinely expensive step.
 		jobs = jobs[:0]
 		for i := 0; i < n; i++ {
-			if sizes[i] < 16+16+2 || remotes[i] == nil {
+			if sizes[i] < recordv1.HeaderSize+16 || remotes[i] == nil {
 				continue
 			}
 			packet := bufs[i][:sizes[i]]
 
-			entry, ok := e.tagTable.Lookup(packet[:16])
+			entry, ok := e.routeTokens.lookup(packet[:recordv1.RouteTokenSize])
 			if !ok {
 				if debugTiming {
-					tagMiss++
+					tokenMiss++
 				}
 				e.handleHandshake(packet, remotes[i], locals[i])
 				continue
 			}
 
-			sess, _ := entry.SessionCtx.(*Session)
-			peer, _ := entry.PeerCtx.(*Peer)
-			if sess == nil || sess.recv == nil {
+			if entry.Sess == nil || entry.Peer == nil {
 				continue
 			}
-			if !sess.recv.PreCheck(entry.PacketNumber) {
-				if debugTiming {
-					precheckFail++
-				}
-				continue
-			}
-			jobs = append(jobs, udpDecryptJob{i: i, sess: sess, peer: peer, pn: entry.PacketNumber, packet: packet})
+			jobs = append(jobs, udpDecryptJob{i: i, sess: entry.Sess, peer: entry.Peer, packet: packet})
 		}
 
 		// Phase 2 (parallel): the AEAD open is a pure function of (keys, pn,
@@ -745,11 +783,12 @@ func (e *Engine) udpToTun(errChan chan error) {
 		// one step actually worth spreading across cores. See parallel.go.
 		parallelRange(len(jobs), func(k int) {
 			j := &jobs[k]
-			out, err := transport.DecapsulateTransport(j.sess.keys, j.pn, j.packet, 16)
+			_, seq, out, err := recordv1.Open(j.sess.recvRecordKeys, j.sess.recvReplay, j.packet)
 			if err != nil {
 				j.failed = true
 				return
 			}
+			j.seq = seq
 			j.out = out
 		})
 
@@ -763,11 +802,8 @@ func (e *Engine) udpToTun(errChan chan error) {
 				}
 				continue
 			}
-			if !j.sess.recv.Commit(j.pn) {
-				if debugTiming {
-					commitFail++
-				}
-				continue
+			if j.sess.recvTokenWindow != nil {
+				j.sess.recvTokenWindow.Observe(j.seq)
 			}
 			if debugTiming {
 				okCount++
@@ -782,25 +818,15 @@ func (e *Engine) udpToTun(errChan chan error) {
 				log.Printf("Peer %x endpoint -> %s via local %s", j.peer.PublicKey[:4], remotes[j.i], locals[j.i])
 			}
 
-			decapsulated := j.out
-			if len(decapsulated) >= 4 {
-				switch string(decapsulated[:4]) {
-				case string(probeMagic[:]):
-					e.handleMTUProbe(decapsulated, j.sess, remotes[j.i], locals[j.i])
-					continue
-				case string(probeAckMagic[:]):
-					handleMTUProbeAck(decapsulated, j.peer)
-					continue
-				case string(meshIntroMagic[:]):
-					e.handleMeshIntro(decapsulated)
-					continue
-				}
-			}
-
-			inner, full, ok := j.sess.handleTransportFrame(decapsulated, now)
-			if !ok {
+			res := j.sess.handleRecordFrame(j.out, now)
+			if !res.ok {
 				continue // keepalive or incomplete fragment
 			}
+			if res.typ == recordv1.FrameControl {
+				e.handleControlPayload(res.payload, j.sess, j.peer, remotes[j.i], locals[j.i])
+				continue
+			}
+			inner, full := res.payload, res.full
 
 			// Hub relay fallback (VEIL-MESH-1.md §5): if this packet's
 			// destination belongs to a *different* connected peer rather than
@@ -825,9 +851,9 @@ func (e *Engine) udpToTun(errChan chan error) {
 			tunBufs = append(tunBufs, full)
 		}
 		if debugTiming && time.Since(lastReport) >= time.Second {
-			log.Printf("[timing] udpToTun ok=%d tagMiss=%d precheckFail=%d decryptFail=%d commitFail=%d",
-				okCount, tagMiss, precheckFail, decryptFail, commitFail)
-			okCount, tagMiss, precheckFail, decryptFail, commitFail = 0, 0, 0, 0, 0
+			log.Printf("[timing] udpToTun ok=%d tokenMiss=%d decryptFail=%d",
+				okCount, tokenMiss, decryptFail)
+			okCount, tokenMiss, decryptFail = 0, 0, 0
 			lastReport = time.Now()
 		}
 		if len(tunBufs) > 0 {
@@ -868,7 +894,7 @@ func (e *Engine) handleHandshake(packet []byte, remote *net.UDPAddr, localIP net
 			continue
 		}
 		if _, keys, _, err := hm.ProcessMsg2(packet, handshakePrefixes); err == nil {
-			sess := establishSession(e.tagTable, p, keys, true, now)
+			sess := establishSession(e.routeTokens, p, keys, true, now)
 			// The initiator holds the keys now, so the session is confirmed and
 			// safe to send on immediately.
 			p.Promote(sess, true)
@@ -932,7 +958,7 @@ func (e *Engine) handleHandshake(packet []byte, remote *net.UDPAddr, localIP net
 		return
 	}
 	peer.SetPath(remote, localIP)
-	sess := establishSession(e.tagTable, peer, keys, false, now)
+	sess := establishSession(e.routeTokens, peer, keys, false, now)
 	// Responder: keep sending on the previous session until the initiator proves
 	// it holds these keys by sending data on the new one (marked in udpToTun).
 	peer.Promote(sess, false)

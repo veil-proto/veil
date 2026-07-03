@@ -3,13 +3,14 @@ package engine
 import (
 	"bytes"
 	"fmt"
-	"github.com/veil-proto/veil/transport"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/curve25519"
 
 	"github.com/veil-proto/veil/core"
+	recordv1 "github.com/veil-proto/veil/record/v1"
+	"github.com/veil-proto/veil/transport"
 )
 
 // runHandshake performs a full Msg1/Msg2 exchange and returns the initiator and
@@ -45,26 +46,43 @@ func runHandshake(t *testing.T, cPriv, sPriv [32]byte, kNet, nid []byte) (cli, s
 	return cliKeys, srvKeys
 }
 
-// deliver replicates the daemon's inbound transport path for one packet against
-// a peer's tag table / sessions. Returns the delivered payload, or an error.
-func deliver(table *transport.TagTable, wire []byte) ([]byte, error) {
-	tag := wire[:16]
-	entry, ok := table.Lookup(tag)
+// deliver replicates the daemon's inbound record/v1 path for one packet against
+// a peer's route-token table / sessions. Returns the delivered user payload,
+// nil for pad-only keepalives, or an error.
+func deliver(table *routeTokenTable, wire []byte) ([]byte, error) {
+	entry, ok := table.lookup(wire[:16])
 	if !ok {
-		return nil, fmt.Errorf("tag not found")
+		return nil, fmt.Errorf("route token not found")
 	}
-	sess := entry.SessionCtx.(*Session)
-	if !sess.recv.PreCheck(entry.PacketNumber) {
-		return nil, fmt.Errorf("replay pre-check rejected %d", entry.PacketNumber)
-	}
-	got, err := transport.DecapsulateTransport(sess.keys, entry.PacketNumber, wire, 16)
+	_, seq, plaintext, err := recordOpen(entry.Sess, wire)
 	if err != nil {
 		return nil, err
 	}
-	if !sess.recv.Commit(entry.PacketNumber) {
-		return nil, fmt.Errorf("commit rejected %d", entry.PacketNumber)
+	if entry.Sess.recvTokenWindow != nil {
+		entry.Sess.recvTokenWindow.Observe(seq)
 	}
-	return got, nil
+	res := entry.Sess.handleRecordFrame(plaintext, time.Now())
+	if !res.ok {
+		return nil, nil
+	}
+	return res.payload, nil
+}
+
+func recordOpen(sess *Session, wire []byte) ([16]byte, uint64, []byte, error) {
+	return recordv1.Open(sess.recvRecordKeys, sess.recvReplay, wire)
+}
+
+func sealTestData(t *testing.T, sess *Session, pn uint64, inner []byte) []byte {
+	t.Helper()
+	frames := makeTransportFrames(inner, maxTransportPlaintext)
+	if len(frames) != 1 {
+		t.Fatalf("test packet unexpectedly fragmented into %d frames", len(frames))
+	}
+	wire, err := sealTransportFrame(sess, pn, frames[0], transportPadLen(len(frames[0]), sess.paddingMode))
+	if err != nil {
+		t.Fatalf("seal %d: %v", pn, err)
+	}
+	return wire
 }
 
 // TestSessionStreamPast2048 streams far more than 2048 transport packets through
@@ -78,19 +96,17 @@ func TestSessionStreamPast2048(t *testing.T) {
 
 	cliKeys, srvKeys := runHandshake(t, cPriv, sPriv, kNet, nid)
 
-	table := transport.NewTagTable()
+	table := newRouteTokenTable()
 	peer := &Peer{PublicKey: []byte{0xAB}}
 	sess := establishSession(table, peer, srvKeys, false, time.Unix(1000, 0))
 	peer.Promote(sess, true)
+	sendSess := newSession(cliKeys, true, time.Unix(1000, 0))
 
 	const total = 5000
 	var pn uint64
 	for ; pn < total; pn++ {
 		inner := []byte(fmt.Sprintf("packet-%d-payload", pn))
-		wire, err := transport.EncapsulateTransport(cliKeys, pn, inner, transportPadLen(len(inner)), 16)
-		if err != nil {
-			t.Fatalf("encap %d: %v", pn, err)
-		}
+		wire := sealTestData(t, sendSess, pn, inner)
 		got, err := deliver(table, wire)
 		if err != nil {
 			t.Fatalf("packet %d: %v", pn, err)
@@ -101,7 +117,7 @@ func TestSessionStreamPast2048(t *testing.T) {
 	}
 
 	// Keepalive: empty inner payload round-trips and delivers zero bytes.
-	ka, _ := transport.EncapsulateTransport(cliKeys, pn, nil, transportPadLen(0), 16)
+	ka := sealTestData(t, sendSess, pn, nil)
 	got, err := deliver(table, ka)
 	if err != nil {
 		t.Fatalf("keepalive: %v", err)
@@ -120,7 +136,7 @@ func TestRekeyGracePeriod(t *testing.T) {
 	kNet := bytes.Repeat([]byte{0x55}, 32)
 	nid := core.DeriveNID("rekey-net", "light")
 
-	table := transport.NewTagTable()
+	table := newRouteTokenTable()
 	peer := &Peer{PublicKey: []byte{0xCD}}
 
 	// First epoch.
@@ -128,9 +144,10 @@ func TestRekeyGracePeriod(t *testing.T) {
 	base := time.Unix(1000, 0)
 	sess1 := establishSession(table, peer, srv1, false, base)
 	peer.Promote(sess1, true)
+	send1 := newSession(cli1, true, base)
 
 	// Send one packet under epoch 1.
-	w1, _ := transport.EncapsulateTransport(cli1, 0, []byte("epoch1-a"), 0, 16)
+	w1 := sealTestData(t, send1, 0, []byte("epoch1-a"))
 	if got, err := deliver(table, w1); err != nil || string(got) != "epoch1-a" {
 		t.Fatalf("epoch1 packet: got=%q err=%v", got, err)
 	}
@@ -139,18 +156,19 @@ func TestRekeyGracePeriod(t *testing.T) {
 	cli2, srv2 := runHandshake(t, cPriv, sPriv, kNet, nid)
 	sess2 := establishSession(table, peer, srv2, false, base)
 	peer.Promote(sess2, true)
+	send2 := newSession(cli2, true, base)
 
 	if peer.Current() != sess2 || peer.previous != sess1 {
 		t.Fatal("promotion did not set current=sess2, previous=sess1")
 	}
 
 	// During grace: an in-flight old-epoch packet still decrypts...
-	w1b, _ := transport.EncapsulateTransport(cli1, 1, []byte("epoch1-b"), 0, 16)
+	w1b := sealTestData(t, send1, 1, []byte("epoch1-b"))
 	if got, err := deliver(table, w1b); err != nil || string(got) != "epoch1-b" {
 		t.Fatalf("in-flight epoch1 packet must still decode: got=%q err=%v", got, err)
 	}
 	// ...and a new-epoch packet decrypts too.
-	w2, _ := transport.EncapsulateTransport(cli2, 0, []byte("epoch2-a"), 0, 16)
+	w2 := sealTestData(t, send2, 0, []byte("epoch2-a"))
 	if got, err := deliver(table, w2); err != nil || string(got) != "epoch2-a" {
 		t.Fatalf("epoch2 packet: got=%q err=%v", got, err)
 	}
@@ -160,12 +178,12 @@ func TestRekeyGracePeriod(t *testing.T) {
 	if peer.previous != nil {
 		t.Fatal("previous session should have been expired")
 	}
-	w1c, _ := transport.EncapsulateTransport(cli1, 2, []byte("epoch1-c"), 0, 16)
+	w1c := sealTestData(t, send1, 2, []byte("epoch1-c"))
 	if _, err := deliver(table, w1c); err == nil {
 		t.Fatal("old-epoch packet must be dropped after previous session expiry")
 	}
 	// New epoch still fine.
-	w2b, _ := transport.EncapsulateTransport(cli2, 1, []byte("epoch2-b"), 0, 16)
+	w2b := sealTestData(t, send2, 1, []byte("epoch2-b"))
 	if got, err := deliver(table, w2b); err != nil || string(got) != "epoch2-b" {
 		t.Fatalf("epoch2 packet after expiry: got=%q err=%v", got, err)
 	}

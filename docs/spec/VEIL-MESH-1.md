@@ -63,58 +63,37 @@ This document covers three pieces end to end:
   authenticated implicitly by riding inside an already-established hub<->
   client transport session (see §3.2) — it needs no separate cryptographic
   gate of its own for milestone-1.
-- A generic typed `frame_type` byte / `VEIL-CANON-1` encoding. `MESH_INTRO`
-  follows the existing magic-prefix-sniff convention (`VFR1`, `VPR1`/`VPA1`)
-  instead — seem §3.1 and `VEIL-CONTROL-1.md`'s v0 appendix for why a fourth
-  one-off magic is preferable to blocking mesh work on the general
-  control-frame redesign (Phase 4).
+- Full `VEIL-CANON-1` control-capsule encoding. `MESH_INTRO` keeps its compact
+  `VMI1` payload for milestone-1, but it is now carried inside encrypted
+  record/v1 `CONTROL` frames.
 
 ## 3. `MESH_INTRO`
 
 ### 3.1 Framing convention
 
-VEIL's current wire format has no general frame-type byte. Every inner
-plaintext (the decrypted payload of a transport record, i.e. what
-`DecapsulateTransport` returns before `Session.handleTransportFrame` looks at
-it) is today one of:
-
-- a raw IP packet (the default — no recognized magic prefix), or
-- a `VFR1`-tagged fragment (`fragment.go`, sniffed by `handleTransportFrame`
-  itself), or
-- a `VPR1`/`VPA1`-tagged MTU probe/ack (`pmtu.go`, sniffed one level up in
-  `udpToTun`, *before* `handleTransportFrame` is even called — see
-  `engine.go`'s dispatch: `switch string(decapsulated[:4])`).
-
-`MESH_INTRO` adds a fourth magic, sniffed at the same dispatch point as
-`VPR1`/`VPA1` (before fragment/raw-packet handling), because — like an MTU
-probe/ack — it is engine control data, never a fragment and never meant to
-reach the TUN device.
+VEIL's Go data plane now uses record/v1 typed inner frames. `MESH_INTRO` is
+engine control data, never a fragment and never meant to reach the TUN device,
+so it is carried as the body of a record/v1 `CONTROL` frame. The control
+payload itself retains the compact milestone-1 magic:
 
 ```go
 var meshIntroMagic = [4]byte{'V', 'M', 'I', '1'}
 ```
 
-Picking the next unused letter after `VFR1`/`VPR1`/`VPA1` keeps the "4-byte
-ASCII-ish tag, V-prefixed, version suffix" convention intact; there is no
-registry beyond "grep the source for existing magics before picking a new
-one," which is adequate at this scale (4 magics total) and is what the
-existing two additions (`VPR1`, `VPA1`) already did.
+The `VMI1` prefix is a payload discriminator inside `CONTROL`, not a top-level
+record discriminator.
 
 ### 3.2 Transport: how `MESH_INTRO` reaches a client
 
-`MESH_INTRO` is sent as the *inner plaintext* of an ordinary transport frame
-on the **existing, already-established hub<->client session** — exactly like
-an MTU probe (`probeSize` calls `transport.EncapsulateTransport` directly
-with the peer's current session keys and next packet number; `MESH_INTRO`
-does the same). This is deliberate:
+`MESH_INTRO` is sent as an encrypted record/v1 `CONTROL` frame on the
+**existing, already-established hub<->client session**. This is deliberate:
 
 - No new handshake, no new session type, no new authentication mechanism:
   the frame is already encrypted+authenticated by the same AEAD/session that
   protects all of that client's traffic, so a `MESH_INTRO` cannot be forged
   by an outside attacker without breaking that session's AEAD.
-- It rides the existing per-peer send path (`sendOnSession` / a bespoke
-  direct `EncapsulateTransport` call — milestone-1 uses the latter, mirroring
-  `probeSize`, since it's a single one-off datagram, not a batched job).
+- It rides the existing per-peer session and uses `sendControlOnSession`, the
+  same helper used by PMTU probe/ack control payloads.
 - It costs nothing when unused: a leaf-only engine (`IsHub() == false`) never
   constructs one.
 
@@ -176,7 +155,7 @@ fixed part). N is capped at 8 (a client's `AllowedIPs` list in practice is a
 handful of routes at most; 8 is generous headroom without inviting an
 oversized frame) — a `MESH_INTRO` claiming more is rejected as malformed,
 silently dropped per `VEIL-INVARIANTS-1.md` invariant 12 (parser failures
-are silent on the wire), same as a malformed `VFR1` fragment.
+are silent on the wire), same as a malformed record/v1 inner frame.
 
 Rationale for each field:
 
@@ -398,14 +377,19 @@ exists:
 
 ### 5.3 Mechanics: exactly which functions change
 
-In `engine.go`'s `udpToTun`, phase 3 (the sequential commit loop, after
-`j.sess.handleTransportFrame` has produced `inner`):
+In `engine.go`'s `udpToTun`, phase 3 (the sequential dispatch loop, after
+`j.sess.handleRecordFrame` has produced a data payload):
 
 ```go
-inner, full, ok := j.sess.handleTransportFrame(decapsulated, now)
-if !ok {
+res := j.sess.handleRecordFrame(plaintext, now)
+if !res.ok {
     continue
 }
+if res.typ == recordv1.FrameControl {
+    e.handleControlPayload(res.payload, j.sess, j.peer, remote, localIP)
+    continue
+}
+inner := res.payload
 if e.IsHub() {
     if dstIP := ExtractDstIP(inner); dstIP != nil {
         if target := e.routingTable.Lookup(dstIP); target != nil && target != j.peer {
@@ -422,7 +406,7 @@ peer-directed sibling of the existing `sendOnSession` helper: it looks up
 `target.SendSession()`/`target.Path()` exactly as `tunToUDP` does for
 locally-originated TUN traffic, and if both are available, re-encrypts
 `inner` under `target`'s session and sends it — i.e. the hub decrypts under
-the sender's session (already done, that's `decapsulated`/`inner`) and
+the sender's session (already done, that's the record plaintext/`inner`) and
 re-encrypts under the destination peer's session, forwarding instead of
 writing to its own TUN, exactly as specified. If `target` has no confirmed
 session or endpoint yet (e.g. never connected, or between handshakes), the
@@ -447,7 +431,7 @@ they match.
 
 - No new session type, no new key material: relay re-encryption uses each
   leaf's already-established session with the hub, same as every other
-  transport frame the hub sends that peer.
+  record/v1 frame the hub sends that peer.
 - No multi-hop: `relayToPeer`'s `target` is always a directly-connected peer
   of this hub. A hub never relays a packet it received *from* a relay (there
   is no such concept in milestone-1 — see §2 Non-goals).

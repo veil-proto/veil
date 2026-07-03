@@ -1,7 +1,7 @@
 # VEIL-KDF-1
 
-**Status:** DRAFT (target/v1). See §v0 Appendix below for what actually runs
-today — they are materially different schemes; do not conflate them.
+**Status:** DRAFT. Go reference implementation exists in `kdf/`; the runtime
+handshake still uses the current `core` KDF bridge described in the appendix.
 
 Source: `VEIL_FINAL_DEVELOPMENT_SPEC.md` §7.
 
@@ -24,7 +24,7 @@ aborts; a disabled term is a typed disabled input, never silently zeroed.
 → `epoch_root_0` follow. See the target spec §7 for the full 8-step chaining
 key derivation (`ck0..ck8`).
 
-## v0 (current prototype) — what actually runs today
+## Runtime bridge — what actually runs today
 
 The current Go handshake (`core/handshake_machine.go`, `core/crypto.go`) is
 an entirely different, simpler scheme: **HKDF-BLAKE2s**, no `suite_id`, no

@@ -23,9 +23,9 @@ library that the platform clients build on.
 
 - **Elligator2-encoded handshake ephemerals** — the handshake's public keys are
   indistinguishable from uniform random bytes to a passive observer.
-- **Per-packet pseudorandom tags** — instead of a static cleartext receiver
-  index, every transport packet carries a fresh BLAKE2s tag, so flows can't be
-  correlated by a constant field.
+- **Short-lived route tokens + protected sequence headers** — instead of a
+  static cleartext receiver index, data packets use bounded route-token
+  windows and a header-protected sequence number.
 - **Network secret folded into the KDF from message one** — a per-network shared
   secret gates the handshake before any DH work.
 - **Length-bucketed handshakes + size-quantized transport padding** — message
@@ -42,8 +42,11 @@ X25519), so the security foundation is the same; the differences are in the
 | Package | Responsibility |
 |---------|----------------|
 | `core` | Handshake state machine, Elligator2, key schedule |
-| `transport` | Per-packet tags, nonces, AEAD encap/decap, replay window |
-| `engine` | OS-independent data plane: peer/tag/routing tables, the three hot loops, path-MTU probing, fragmentation, stats. Drives any `engine.Tun` + `*net.UDPConn` |
+| `record/v1` | Route-token records, header protection, AEAD seal/open, replay, typed inner frames |
+| `tokens` | Rendezvous/route/path token derivation helpers |
+| `canon`, `kdf`, `control/v1`, `epoch`, `pq` | Target v1 reference helpers used by tests and the next runtime phases |
+| `transport` | Legacy v0 transport package retained for compatibility/reference tests |
+| `engine` | OS-independent data plane: peer/route-token/routing tables, hot loops, path-MTU probing, fragmentation, stats. Drives any `engine.Tun` + `*net.UDPConn` |
 | `config` | `.conf` / config-text parsing |
 | `link` | `veil://` shareable config links |
 
