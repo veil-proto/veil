@@ -1,0 +1,14 @@
+:root {
+  --veil-navy-950: #050814;
+  --veil-navy-900: #071126;
+  --veil-indigo-700: #343B8F;
+  --veil-violet-600: #6D43E6;
+  --veil-purple-500: #8758FF;
+  --veil-cyan-400: #25D7E8;
+  --veil-teal-300: #46F0E5;
+  --veil-slate-500: #53627F;
+
+  --veil-gradient-brand: linear-gradient(145deg, #343B8F 0%, #6D43E6 52%, #8758FF 100%);
+  --veil-gradient-bg: radial-gradient(circle at 50% 42%, #101D48 0%, #071126 48%, #050814 100%);
+  --veil-glow-cyan: 0 0 24px rgba(37, 215, 232, 0.45);
+}

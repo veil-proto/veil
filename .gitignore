@@ -1,0 +1,11 @@
+# Build output
+/dist/
+*.exe
+*.dll
+*.msi
+# Local/runtime
+*.log
+*.conf
+!example*.conf
+# Go
+/vendor/
