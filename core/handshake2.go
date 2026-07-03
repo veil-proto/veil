@@ -6,18 +6,18 @@ import (
 )
 
 type Msg2SessionParams struct {
-	TagLen                 byte
-	TagWindowLog2          byte
-	ReplayWindowLog2       byte
-	PaddingProfile         byte
-	InnerMTU               uint16
-	KeepaliveSeconds       uint16
-	RekeyAfterTime         uint32
-	RejectAfterTime        uint32
-	RekeyAfterPacketsLog2  byte
-	SessionNonceSeed       [32]byte
-	ResponderNonce         [16]byte
-	Reserved               [31]byte
+	TagLen                byte
+	TagWindowLog2         byte
+	ReplayWindowLog2      byte
+	PaddingProfile        byte
+	InnerMTU              uint16
+	KeepaliveSeconds      uint16
+	RekeyAfterTime        uint32
+	RejectAfterTime       uint32
+	RekeyAfterPacketsLog2 byte
+	SessionNonceSeed      [32]byte
+	ResponderNonce        [16]byte
+	Reserved              [31]byte
 }
 
 func (m *Msg2SessionParams) Encode() []byte {

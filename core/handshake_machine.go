@@ -19,6 +19,16 @@ type HandshakeMachine struct {
 	LocalPub    [32]byte
 	RemotePub   [32]byte
 
+	// PSK is the optional 32-byte per-peer pre-shared secret, mixed into the
+	// msg2/session KDF as an additional authentication factor. Nil/empty means
+	// no PSK is configured for this peer: the KDF input falls back to a fixed
+	// 32-byte zero block, byte-identical to how every handshake behaved before
+	// PSK support existed, so PSK-less configs are unaffected by this field.
+	// Responders learn which peer they're talking to only after ProcessMsg1
+	// (which sets RemotePub from the decrypted payload), so callers on the
+	// responder side must set PSK between ProcessMsg1 and ConstructMsg2.
+	PSK []byte
+
 	LocalEPriv [32]byte
 	LocalEPub  [32]byte
 	LocalERep  [32]byte // Elligator2 representative of LocalEPub (wire image)
@@ -27,6 +37,44 @@ type HandshakeMachine struct {
 
 	Th   []byte
 	DhEs []byte // X25519(e_i_priv, S_pub)
+}
+
+// zeroBytes overwrites b in place. Best-effort hygiene for short-lived secret
+// buffers (DH outputs, KDF inputs) once they've been consumed; Go's GC and
+// compiler make no hard guarantees against this being optimized away or the
+// backing memory being copied elsewhere first, but it costs nothing and
+// narrows the window a secret sits in memory after last use.
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+// isAllZero reports whether every byte in b is zero. X25519 outputs an
+// all-zero shared secret only for a small set of degenerate/low-order public
+// keys; a correctly random peer key essentially never produces one, so
+// seeing it here means the remote key was crafted to force a known,
+// attacker-predictable shared secret. Every DH term VEIL enables must be
+// checked with this and abort the handshake on a match — silently proceeding
+// would hand the attacker a known session key.
+func isAllZero(b []byte) bool {
+	var v byte
+	for _, c := range b {
+		v |= c
+	}
+	return v == 0
+}
+
+// pskInput returns the 32-byte PSK KDF input for this handshake: the
+// configured PSK if present and correctly sized, otherwise a fixed zero
+// block (the historical always-zero behavior, preserved for PSK-less peers).
+func (hm *HandshakeMachine) pskInput() []byte {
+	if len(hm.PSK) == 32 {
+		out := make([]byte, 32)
+		copy(out, hm.PSK)
+		return out
+	}
+	return make([]byte, 32)
 }
 
 func NewHandshakeMachine(isInitiator bool, kNet, nid []byte, localPriv, remotePub [32]byte) *HandshakeMachine {
@@ -60,6 +108,9 @@ func (hm *HandshakeMachine) ConstructMsg1(prefix []byte) ([]byte, error) {
 	hm.DhEs, err = curve25519.X25519(hm.LocalEPriv[:], hm.RemotePub[:])
 	if err != nil {
 		return nil, err
+	}
+	if isAllZero(hm.DhEs) {
+		return nil, errors.New("dh_es produced an all-zero shared secret")
 	}
 
 	h, _ := blake2s.New256(nil)
@@ -190,6 +241,9 @@ func (hm *HandshakeMachine) ProcessMsg1(packet []byte, allowedPrefixes []int) (*
 	if err != nil {
 		return nil, nil, err
 	}
+	if isAllZero(hm.DhEs) {
+		return nil, nil, errors.New("dh_es produced an all-zero shared secret")
+	}
 
 	h, _ := blake2s.New256(nil)
 	h.Write(hm.KNet)
@@ -274,12 +328,18 @@ func (hm *HandshakeMachine) ConstructMsg2(prefix2 []byte, params *Msg2SessionPar
 	if err != nil {
 		return nil, nil, err
 	}
+	if isAllZero(dhEe) || isAllZero(dhSe) || isAllZero(dhStatic) {
+		return nil, nil, errors.New("dh_ee/dh_se/dh_static produced an all-zero shared secret")
+	}
 
 	var kHs2Input []byte
 	kHs2Input = append(kHs2Input, dhEe...)
 	kHs2Input = append(kHs2Input, dhSe...)
 	kHs2Input = append(kHs2Input, dhStatic...)
-	kHs2Input = append(kHs2Input, make([]byte, 32)...) // PSK zero
+	kHs2Input = append(kHs2Input, hm.pskInput()...)
+	zeroBytes(dhEe)
+	zeroBytes(dhSe)
+	zeroBytes(dhStatic)
 
 	kHs2, err := HKDFBlake2s(kHs2Input, hm.Th, []byte("VEIL hs2 key"), 32)
 	if err != nil {
@@ -349,6 +409,8 @@ func (hm *HandshakeMachine) ConstructMsg2(prefix2 []byte, params *Msg2SessionPar
 
 	// Compute Master and Transport Keys
 	keys, err := hm.computeTransportKeys(kHs2Input, params)
+	zeroBytes(kHs2Input)
+	zeroBytes(kHs2)
 	return packet, keys, err
 }
 
@@ -419,12 +481,18 @@ func (hm *HandshakeMachine) ProcessMsg2(packet []byte, allowedPrefixes []int) (*
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	if isAllZero(dhEe) || isAllZero(dhSe) || isAllZero(dhStatic) {
+		return nil, nil, nil, errors.New("dh_ee/dh_se/dh_static produced an all-zero shared secret")
+	}
 
 	var kHs2Input []byte
 	kHs2Input = append(kHs2Input, dhEe...)
 	kHs2Input = append(kHs2Input, dhSe...)
 	kHs2Input = append(kHs2Input, dhStatic...)
-	kHs2Input = append(kHs2Input, make([]byte, 32)...) // PSK zero
+	kHs2Input = append(kHs2Input, hm.pskInput()...)
+	zeroBytes(dhEe)
+	zeroBytes(dhSe)
+	zeroBytes(dhStatic)
 
 	kHs2, err := HKDFBlake2s(kHs2Input, hm.Th, []byte("VEIL hs2 key"), 32)
 	if err != nil {
@@ -485,6 +553,8 @@ func (hm *HandshakeMachine) ProcessMsg2(packet []byte, allowedPrefixes []int) (*
 	hm.Th = hTh2.Sum(nil)
 
 	keys, err := hm.computeTransportKeys(kHs2Input, params)
+	zeroBytes(kHs2Input)
+	zeroBytes(kHs2)
 	return params, keys, parsedPrefix, err
 }
 
@@ -503,6 +573,10 @@ func (hm *HandshakeMachine) computeTransportKeys(kHs2Input []byte, params *Msg2S
 	kR2I, _ := HKDFBlake2s(kMaster, hm.Th, []byte("transport r2i key"), 32)
 	kTagI2R, _ := HKDFBlake2s(kMaster, hm.Th, []byte("tag i2r key"), 32)
 	kTagR2I, _ := HKDFBlake2s(kMaster, hm.Th, []byte("tag r2i key"), 32)
+
+	zeroBytes(kMasterInput)
+	zeroBytes(kMaster)
+	zeroBytes(hm.DhEs)
 
 	hCtx, _ := blake2s.New256(nil)
 	hCtx.Write(hm.NID)

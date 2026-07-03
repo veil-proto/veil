@@ -5,8 +5,8 @@ import (
 )
 
 const (
-	Version       = "veil-v0.2-lite"
-	CryptoSuite   = "X25519-BLAKE2s-ChaCha20Poly1305"
+	Version     = "veil-v0.2-lite"
+	CryptoSuite = "X25519-BLAKE2s-ChaCha20Poly1305"
 )
 
 // DeriveNID derives the Network Identifier.

@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/hex"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 
@@ -21,9 +22,14 @@ type InterfaceConfig struct {
 	ListenPort  int
 	NID         []byte
 	NetSecret   []byte
-	Padding     string
-	DNS         string // comma-separated DNS servers set inside the tunnel (client)
-	FwMark      int
+	// NetSecretInsecure is set when NetSecret in the config file was the
+	// literal sentinel "insecure" rather than a 32-byte hex secret — an
+	// explicit, deliberate opt-out of the per-network pre-DH gate, never an
+	// implicit default. See Validate().
+	NetSecretInsecure bool
+	Padding           string
+	DNS               string // comma-separated DNS servers set inside the tunnel (client)
+	FwMark            int
 }
 
 type PeerConfig struct {
@@ -41,6 +47,69 @@ func parseHex(s string) ([]byte, error) {
 		return nil, nil
 	}
 	return hex.DecodeString(s)
+}
+
+// Serialize renders the config back into VEIL .conf text (INI-style,
+// [Interface] followed by one [Peer] section per peer). It is the inverse of
+// LoadConfigString: parsing Serialize's output must reproduce equivalent
+// field values (see the round-trip test in config_test.go). Only fields that
+// LoadConfigString itself understands are written back out — this is not a
+// general-purpose INI writer, just enough for the GUI (and any other caller)
+// to persist an in-memory Config it built or edited.
+func (c *Config) Serialize() string {
+	var b strings.Builder
+
+	b.WriteString("[Interface]\n")
+	if len(c.Interface.PrivateKey) > 0 {
+		fmt.Fprintf(&b, "PrivateKey = %s\n", hex.EncodeToString(c.Interface.PrivateKey))
+	}
+	if c.Interface.Address != "" {
+		fmt.Fprintf(&b, "Address = %s\n", c.Interface.Address)
+	}
+	if c.Interface.BindAddress != "" {
+		fmt.Fprintf(&b, "BindAddress = %s\n", c.Interface.BindAddress)
+	}
+	if c.Interface.ListenPort != 0 {
+		fmt.Fprintf(&b, "ListenPort = %d\n", c.Interface.ListenPort)
+	}
+	if len(c.Interface.NID) > 0 {
+		fmt.Fprintf(&b, "NID = %s\n", hex.EncodeToString(c.Interface.NID))
+	}
+	if c.Interface.NetSecretInsecure {
+		b.WriteString("NetSecret = insecure\n")
+	} else if len(c.Interface.NetSecret) > 0 {
+		fmt.Fprintf(&b, "NetSecret = %s\n", hex.EncodeToString(c.Interface.NetSecret))
+	}
+	if c.Interface.Padding != "" {
+		fmt.Fprintf(&b, "Padding = %s\n", c.Interface.Padding)
+	}
+	if c.Interface.DNS != "" {
+		fmt.Fprintf(&b, "DNS = %s\n", c.Interface.DNS)
+	}
+	if c.Interface.FwMark != 0 {
+		fmt.Fprintf(&b, "FwMark = %d\n", c.Interface.FwMark)
+	}
+
+	for _, p := range c.Peers {
+		b.WriteString("\n[Peer]\n")
+		if len(p.PublicKey) > 0 {
+			fmt.Fprintf(&b, "PublicKey = %s\n", hex.EncodeToString(p.PublicKey))
+		}
+		if len(p.AllowedIPs) > 0 {
+			fmt.Fprintf(&b, "AllowedIPs = %s\n", strings.Join(p.AllowedIPs, ", "))
+		}
+		if p.Endpoint != "" {
+			fmt.Fprintf(&b, "Endpoint = %s\n", p.Endpoint)
+		}
+		if p.PersistentKeepalive != 0 {
+			fmt.Fprintf(&b, "PersistentKeepalive = %d\n", p.PersistentKeepalive)
+		}
+		if len(p.PresharedKey) > 0 {
+			fmt.Fprintf(&b, "PresharedKey = %s\n", hex.EncodeToString(p.PresharedKey))
+		}
+	}
+
+	return b.String()
 }
 
 // LoadConfig reads and parses a VEIL config file from disk.
@@ -92,7 +161,9 @@ func loadFrom(source any) (*Config, error) {
 	}
 
 	netSecHex := ifaceSec.Key("NetSecret").String()
-	if parsedConfig.Interface.NetSecret, err = parseHex(netSecHex); err != nil {
+	if strings.EqualFold(strings.TrimSpace(netSecHex), "insecure") {
+		parsedConfig.Interface.NetSecretInsecure = true
+	} else if parsedConfig.Interface.NetSecret, err = parseHex(netSecHex); err != nil {
 		return nil, fmt.Errorf("invalid NetSecret: %v", err)
 	}
 
@@ -150,5 +221,114 @@ func loadFrom(source any) (*Config, error) {
 		parsedConfig.Peers = append(parsedConfig.Peers, peer)
 	}
 
+	if err := parsedConfig.Validate(); err != nil {
+		return nil, err
+	}
 	return &parsedConfig, nil
+}
+
+// ValidationError aggregates every problem found by Validate, so a caller can
+// report all of them at once instead of stopping at the first.
+type ValidationError struct {
+	Errors []error
+}
+
+func (v *ValidationError) Error() string {
+	parts := make([]string, len(v.Errors))
+	for i, e := range v.Errors {
+		parts[i] = e.Error()
+	}
+	return "invalid config: " + strings.Join(parts, "; ")
+}
+
+// Validate checks structural and cryptographic-length invariants that the
+// loader itself does not enforce: exact key lengths, valid endpoints/CIDRs,
+// and duplicate peer keys. A config that fails Validate must not be handed
+// to engine.New — previously, bad values here were silently truncated,
+// zero-padded, or dropped instead of rejected.
+func (c *Config) Validate() error {
+	var errs []error
+	add := func(format string, args ...any) {
+		errs = append(errs, fmt.Errorf(format, args...))
+	}
+
+	if len(c.Interface.PrivateKey) != 32 {
+		add("Interface.PrivateKey must be exactly 32 bytes (got %d)", len(c.Interface.PrivateKey))
+	}
+	if len(c.Interface.NID) != 32 {
+		add("Interface.NID must be exactly 32 bytes (got %d)", len(c.Interface.NID))
+	}
+	if c.Interface.NetSecretInsecure {
+		if len(c.Interface.NetSecret) != 0 {
+			add("Interface.NetSecret cannot be set when NetSecret = insecure is also used")
+		}
+	} else if len(c.Interface.NetSecret) != 32 {
+		add("Interface.NetSecret must be exactly 32 bytes, or explicitly set to \"insecure\" to opt out (got %d bytes)", len(c.Interface.NetSecret))
+	}
+
+	seenPeerKeys := make(map[string]int, len(c.Peers))
+	for i, p := range c.Peers {
+		label := fmt.Sprintf("Peer[%d]", i)
+		for _, perr := range p.validate(label) {
+			add("%s", perr.Error())
+		}
+		if len(p.PublicKey) == 32 {
+			key := hex.EncodeToString(p.PublicKey)
+			if first, dup := seenPeerKeys[key]; dup {
+				add("%s.PublicKey is a duplicate of Peer[%d]", label, first)
+			} else {
+				seenPeerKeys[key] = i
+			}
+		}
+	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+	return &ValidationError{Errors: errs}
+}
+
+// Validate checks a single peer in isolation (everything validate() checks
+// except cross-peer duplicate-key detection, which only makes sense against
+// a full peer set). Used directly by callers adding one peer at a time
+// outside a full Config — e.g. Engine.AddPeer.
+func (p *PeerConfig) Validate() error {
+	errs := p.validate("Peer")
+	if len(errs) == 0 {
+		return nil
+	}
+	return &ValidationError{Errors: errs}
+}
+
+func (p *PeerConfig) validate(label string) []error {
+	var errs []error
+	add := func(format string, args ...any) {
+		errs = append(errs, fmt.Errorf(format, args...))
+	}
+
+	if len(p.PublicKey) != 32 {
+		add("%s.PublicKey must be exactly 32 bytes (got %d)", label, len(p.PublicKey))
+	}
+
+	if len(p.PresharedKey) != 0 && len(p.PresharedKey) != 32 {
+		add("%s.PresharedKey must be exactly 32 bytes if set (got %d)", label, len(p.PresharedKey))
+	}
+
+	if p.Endpoint != "" {
+		if _, err := net.ResolveUDPAddr("udp", p.Endpoint); err != nil {
+			add("%s.Endpoint %q is invalid: %v", label, p.Endpoint, err)
+		}
+	}
+
+	for _, cidr := range p.AllowedIPs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			add("%s.AllowedIPs entry %q is invalid: %v", label, cidr, err)
+		}
+	}
+
+	if p.PersistentKeepalive < 0 {
+		add("%s.PersistentKeepalive must not be negative (got %d)", label, p.PersistentKeepalive)
+	}
+
+	return errs
 }

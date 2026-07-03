@@ -15,11 +15,16 @@ type Peer struct {
 	IfaceCfg  *config.InterfaceConfig
 
 	// Static handshake material, captured once at startup.
-	localPriv   [32]byte
-	remotePub   [32]byte
-	nid         []byte
-	kNet        []byte
-	isInitiator bool
+	localPriv    [32]byte
+	remotePub    [32]byte
+	nid          []byte
+	kNet         []byte
+	presharedKey []byte // optional, 32 bytes when configured; nil otherwise
+	isInitiator  bool
+
+	// keepaliveOverride is this peer's configured PersistentKeepalive, or 0 to
+	// use the engine-wide jittered default (see keepaliveInterval in engine.go).
+	keepaliveOverride time.Duration
 
 	mu       sync.RWMutex
 	endpoint *net.UDPAddr
@@ -267,7 +272,7 @@ func (p *Peer) endProbe() { p.probing.Store(false) }
 
 // lastMTUCheck / setLastMTUCheck track when maintenance last scheduled a
 // periodic MTU refresh for this peer.
-func (p *Peer) lastMTUCheck() time.Time { return time.Unix(0, p.lastMTUCheckNano.Load()) }
+func (p *Peer) lastMTUCheck() time.Time     { return time.Unix(0, p.lastMTUCheckNano.Load()) }
 func (p *Peer) setLastMTUCheck(t time.Time) { p.lastMTUCheckNano.Store(t.UnixNano()) }
 
 // LastRecv reports when a valid packet was last received from this peer.

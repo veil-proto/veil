@@ -1,9 +1,9 @@
 package engine
 
 import (
-	"github.com/veil-proto/veil/transport"
 	"bytes"
 	"fmt"
+	"github.com/veil-proto/veil/transport"
 	"testing"
 	"time"
 

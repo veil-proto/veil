@@ -38,14 +38,19 @@ func HKDFBlake2s(secret, salt, info []byte, outLen int) ([]byte, error) {
 	return out, nil
 }
 
+// Msg1Payload previously carried an 8-byte PskID field. Nothing ever consumed
+// it (the PSK, when configured, is a single fixed per-peer secret known to
+// both sides out of band — there is no multi-PSK selection to hint at), so it
+// was dead ceremonial wire surface. Removed in favor of Reserved to keep the
+// wire size and all downstream offset math in ConstructMsg1/ProcessMsg1
+// unchanged.
 type Msg1Payload struct {
 	CPub                    [32]byte
 	Timestamp               [12]byte
 	ClientNonce             [16]byte
-	PskID                   [8]byte
 	RequestedTagLen         byte
 	RequestedPaddingProfile byte
-	Reserved                [14]byte
+	Reserved                [22]byte
 }
 
 func (m *Msg1Payload) Encode() []byte {
@@ -53,10 +58,9 @@ func (m *Msg1Payload) Encode() []byte {
 	copy(out[0:32], m.CPub[:])
 	copy(out[32:44], m.Timestamp[:])
 	copy(out[44:60], m.ClientNonce[:])
-	copy(out[60:68], m.PskID[:])
-	out[68] = m.RequestedTagLen
-	out[69] = m.RequestedPaddingProfile
-	copy(out[70:84], m.Reserved[:])
+	out[60] = m.RequestedTagLen
+	out[61] = m.RequestedPaddingProfile
+	copy(out[62:84], m.Reserved[:])
 	return out
 }
 
@@ -68,10 +72,9 @@ func DecodeMsg1Payload(data []byte) (*Msg1Payload, error) {
 	copy(m.CPub[:], data[0:32])
 	copy(m.Timestamp[:], data[32:44])
 	copy(m.ClientNonce[:], data[44:60])
-	copy(m.PskID[:], data[60:68])
-	m.RequestedTagLen = data[68]
-	m.RequestedPaddingProfile = data[69]
-	copy(m.Reserved[:], data[70:84])
+	m.RequestedTagLen = data[60]
+	m.RequestedPaddingProfile = data[61]
+	copy(m.Reserved[:], data[62:84])
 	return &m, nil
 }
 

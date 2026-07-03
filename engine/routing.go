@@ -2,6 +2,7 @@ package engine
 
 import (
 	"net"
+	"sync"
 )
 
 type RoutingTable struct {
@@ -9,6 +10,12 @@ type RoutingTable struct {
 	// routes a typical deployment has; a production kmod-scale table would swap
 	// this for an LPM trie (see docs/v1/VEIL-v1-kmod-design.md), but the match
 	// semantics below — most-specific prefix wins — must stay identical.
+	//
+	// mu guards routes. Routes are installed once at startup (New) with no
+	// concurrent readers yet, but Engine.AddPeer/RemovePeer can add or remove
+	// routes at runtime while the tunToUDP hot loop is concurrently calling
+	// Lookup, so both paths must go through the lock.
+	mu     sync.RWMutex
 	routes []RouteEntry
 }
 
@@ -24,10 +31,28 @@ func NewRoutingTable() *RoutingTable {
 }
 
 func (rt *RoutingTable) AddRoute(network *net.IPNet, peer *Peer) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	rt.routes = append(rt.routes, RouteEntry{
 		Network: network,
 		Peer:    peer,
 	})
+}
+
+// RemoveRoutesForPeer drops every route pointing at peer. Used by
+// Engine.RemovePeer to undo AddPeer's route installation.
+func (rt *RoutingTable) RemoveRoutesForPeer(peer *Peer) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	w := 0
+	for _, r := range rt.routes {
+		if r.Peer == peer {
+			continue
+		}
+		rt.routes[w] = r
+		w++
+	}
+	rt.routes = rt.routes[:w]
 }
 
 // Lookup returns the peer owning the most-specific (longest-prefix) route that
@@ -36,6 +61,8 @@ func (rt *RoutingTable) AddRoute(network *net.IPNet, peer *Peer) {
 // and another the more specific 10.8.1.0/24, a packet to 10.8.1.5 must go to the
 // /24's peer regardless of which route was configured first.
 func (rt *RoutingTable) Lookup(ip net.IP) *Peer {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
 	var best *Peer
 	bestOnes := -1
 	for i := range rt.routes {

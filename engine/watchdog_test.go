@@ -25,9 +25,29 @@ func TestTunnelSilent(t *testing.T) {
 		{"past timeout", sess, now.Add(-(watchdogTimeout + time.Second)), true},
 	}
 	for _, c := range cases {
-		if got := tunnelSilent(c.cur, c.lastRecv, now); got != c.want {
+		if got := tunnelSilent(c.cur, c.lastRecv, now, 0); got != c.want {
 			t.Errorf("%s: tunnelSilent = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// TestTunnelSilentScalesWithKeepaliveOverride verifies a peer with a
+// PersistentKeepalive longer than watchdogTimeout/4 gets a proportionally
+// longer watchdog, so its own configured keepalive cadence isn't mistaken
+// for a dead tunnel.
+func TestTunnelSilentScalesWithKeepaliveOverride(t *testing.T) {
+	now := time.Now()
+	sess := &Session{establishedAt: now.Add(-10 * time.Minute)}
+	override := 60 * time.Second // 4x = 240s, well past the 90s default watchdog
+
+	// Silent for 100s: past the fixed default watchdog, but within this
+	// peer's scaled-up watchdog — must not fire.
+	if tunnelSilent(sess, now.Add(-100*time.Second), now, override) {
+		t.Fatal("watchdog fired before the scaled timeout for a long-keepalive peer")
+	}
+	// Silent well past 4x the override: must fire.
+	if !tunnelSilent(sess, now.Add(-250*time.Second), now, override) {
+		t.Fatal("watchdog did not fire once truly silent past the scaled timeout")
 	}
 }
 

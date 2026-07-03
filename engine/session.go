@@ -76,8 +76,21 @@ func (s *Session) age(now time.Time) time.Duration { return now.Sub(s.establishe
 // tunnelSilent reports whether an established tunnel has gone quiet long enough
 // to be treated as silently dead: there is a current session (so we've
 // connected at least once) but nothing valid has arrived from the peer for
-// longer than watchdogTimeout. Pure function of its inputs so it can be tested
-// without the maintenance loop's real-time clock.
-func tunnelSilent(cur *Session, lastRecv, now time.Time) bool {
-	return cur != nil && now.Sub(lastRecv) > watchdogTimeout
+// longer than the effective watchdog timeout. Pure function of its inputs so
+// it can be tested without the maintenance loop's real-time clock.
+func tunnelSilent(cur *Session, lastRecv, now time.Time, keepaliveOverride time.Duration) bool {
+	return cur != nil && now.Sub(lastRecv) > effectiveWatchdogTimeout(keepaliveOverride)
+}
+
+// effectiveWatchdogTimeout scales the watchdog with a peer's configured
+// PersistentKeepalive: a peer that keeps alive every 120s can go silent for
+// close to that long as ordinary jitter, not a dead tunnel, so watchdogTimeout
+// alone would misfire for anyone with a keepalive interval longer than about
+// watchdogTimeout/4. Peers using the default keepalive get the unmodified
+// constant.
+func effectiveWatchdogTimeout(keepaliveOverride time.Duration) time.Duration {
+	if scaled := keepaliveOverride * 4; scaled > watchdogTimeout {
+		return scaled
+	}
+	return watchdogTimeout
 }

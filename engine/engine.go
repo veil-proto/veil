@@ -7,6 +7,7 @@ package engine
 // addresses / routes / DNS before calling Run.
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -16,12 +17,19 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/veil-proto/veil/config"
 	"github.com/veil-proto/veil/core"
+	"github.com/veil-proto/veil/internal/ratelog"
 	"github.com/veil-proto/veil/transport"
 )
+
+// unconfiguredPeerLog rate-limits the "Msg1 from unconfigured client key" log
+// line (see handleHandshake) — see ratelog's package doc for why any
+// wire-triggered log line needs this.
+var unconfiguredPeerLog = ratelog.NewLimiter(5 * time.Second)
 
 // Tun is the minimal TUN interface the data plane needs. OS front-ends (the
 // per-OS client repos) provide a concrete implementation.
@@ -67,6 +75,19 @@ func (pt *PeerTable) GetPeer(pubKey []byte) *Peer {
 	pt.mu.RLock()
 	defer pt.mu.RUnlock()
 	return pt.peers[hex.EncodeToString(pubKey)]
+}
+
+// RemovePeer drops the peer with the given public key, if any, and reports
+// whether one was found.
+func (pt *PeerTable) RemovePeer(pubKey []byte) (*Peer, bool) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	key := hex.EncodeToString(pubKey)
+	p, ok := pt.peers[key]
+	if ok {
+		delete(pt.peers, key)
+	}
+	return p, ok
 }
 
 func (pt *PeerTable) GetAllPeers() []*Peer {
@@ -198,8 +219,15 @@ func sendOnSession(conn *udpConn, endpoint *net.UDPAddr, localIP net.IP, peer *P
 	return nil
 }
 
-func keepaliveInterval() time.Duration {
+// keepaliveInterval returns the jittered keepalive period for peer: its
+// configured PersistentKeepalive if set (peer.keepaliveOverride > 0),
+// otherwise the engine-wide default. Either way the result is jittered by
+// +/-20% so many peers on the same interval don't all send in lockstep.
+func keepaliveInterval(peer *Peer) time.Duration {
 	base := keepaliveDefault
+	if peer.keepaliveOverride > 0 {
+		base = peer.keepaliveOverride
+	}
 	jitter := base / 5
 	return base - jitter + time.Duration(randUint(int(2*jitter)))
 }
@@ -214,12 +242,35 @@ type Engine struct {
 	routingTable *RoutingTable
 	tagTable     *transport.TagTable
 	localPriv    [32]byte
+
+	// isHub marks this Engine as mesh-hub-capable: willing to relay data
+	// packets between two other peers (see the hub relay branch in
+	// udpToTun/VEIL-MESH-1.md) and to introduce peers to each other via
+	// MESH_INTRO. Leaf clients never set this, so they carry no forwarding
+	// logic on their data-plane hot path — see EnableMeshHub.
+	isHub atomic.Bool
+
+	// Lifecycle. ctx/cancel are set by Run; Close cancels ctx so the three hot
+	// loops can stop, and Wait blocks until they actually have. The Engine
+	// does not own tun/conn (New's caller does), so Close never closes them —
+	// it only signals the loops. tunToUDP/udpToTun still block on ReadBatch/
+	// socket reads with no cancellation of their own, so a full clean stop is
+	// always "eng.Close(); eng.Wait()" *and* the caller separately closing
+	// tun/conn to unblock those reads — see the veil-linux/veil-windows
+	// shutdown paths for the pattern.
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 // New builds an Engine from a parsed config, a ready TUN device and a bound UDP
 // socket. Interface addressing / routing / DNS must already be configured by the
 // caller (that part is OS-specific).
 func New(cfg *config.Config, tunDev Tun, conn *net.UDPConn) (*Engine, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	e := &Engine{
 		cfg:          cfg,
 		tun:          tunDev,
@@ -231,52 +282,143 @@ func New(cfg *config.Config, tunDev Tun, conn *net.UDPConn) (*Engine, error) {
 	copy(e.localPriv[:], cfg.Interface.PrivateKey)
 
 	for _, pcfg := range cfg.Peers {
-		var endpointAddr *net.UDPAddr
-		if pcfg.Endpoint != "" {
-			addr, err := net.ResolveUDPAddr("udp", pcfg.Endpoint)
-			if err != nil {
-				return nil, fmt.Errorf("resolve endpoint %s: %w", pcfg.Endpoint, err)
-			}
-			endpointAddr = addr
-		}
-
-		var remotePub [32]byte
-		copy(remotePub[:], pcfg.PublicKey)
-
-		peer := &Peer{
-			PublicKey:   pcfg.PublicKey,
-			IfaceCfg:    &cfg.Interface,
-			localPriv:   e.localPriv,
-			remotePub:   remotePub,
-			nid:         cfg.Interface.NID,
-			kNet:        cfg.Interface.NetSecret,
-			isInitiator: endpointAddr != nil,
-			endpoint:    endpointAddr,
-		}
-		e.peerTable.AddPeer(peer)
-
-		for _, allowedIP := range pcfg.AllowedIPs {
-			if _, ipnet, err := net.ParseCIDR(allowedIP); err == nil {
-				e.routingTable.AddRoute(ipnet, peer)
-				log.Printf("Added route %s -> Peer %x", allowedIP, pcfg.PublicKey[:4])
-			}
+		if _, err := e.installPeer(pcfg); err != nil {
+			return nil, err
 		}
 	}
 	return e, nil
 }
 
-// Run launches the data-plane goroutines and blocks until a loop reports a fatal
-// error on errChan.
-func (e *Engine) Run(errChan chan error) {
-	go e.maintenanceLoop()
-	go e.tunToUDP(errChan)
-	go e.udpToTun(errChan)
+// installPeer builds a *Peer from pcfg, registers it in the peer table, and
+// installs its AllowedIPs routes. Shared by New (static config-time peers)
+// and AddPeer (runtime-added peers).
+func (e *Engine) installPeer(pcfg config.PeerConfig) (*Peer, error) {
+	var endpointAddr *net.UDPAddr
+	if pcfg.Endpoint != "" {
+		addr, err := net.ResolveUDPAddr("udp", pcfg.Endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("resolve endpoint %s: %w", pcfg.Endpoint, err)
+		}
+		endpointAddr = addr
+	}
+
+	var remotePub [32]byte
+	copy(remotePub[:], pcfg.PublicKey)
+
+	peer := &Peer{
+		PublicKey:         pcfg.PublicKey,
+		IfaceCfg:          &e.cfg.Interface,
+		localPriv:         e.localPriv,
+		remotePub:         remotePub,
+		nid:               e.cfg.Interface.NID,
+		kNet:              e.cfg.Interface.NetSecret,
+		presharedKey:      pcfg.PresharedKey,
+		isInitiator:       endpointAddr != nil,
+		endpoint:          endpointAddr,
+		keepaliveOverride: time.Duration(pcfg.PersistentKeepalive) * time.Second,
+	}
+	e.peerTable.AddPeer(peer)
+
+	for _, allowedIP := range pcfg.AllowedIPs {
+		if _, ipnet, err := net.ParseCIDR(allowedIP); err == nil {
+			e.routingTable.AddRoute(ipnet, peer)
+			log.Printf("Added route %s -> Peer %x", allowedIP, pcfg.PublicKey[:4])
+		}
+	}
+	return peer, nil
+}
+
+// AddPeer registers a new peer at runtime — e.g. a mesh peer introduced by a
+// hub after the tunnel is already running — validating pcfg exactly as
+// static config-time peers are validated. It is safe to call concurrently
+// with the running data-plane loops.
+func (e *Engine) AddPeer(pcfg config.PeerConfig) error {
+	if err := pcfg.Validate(); err != nil {
+		return err
+	}
+	if p := e.peerTable.GetPeer(pcfg.PublicKey); p != nil {
+		return fmt.Errorf("peer %x already exists", pcfg.PublicKey[:4])
+	}
+	_, err := e.installPeer(pcfg)
+	return err
+}
+
+// RemovePeer tears down the peer with the given public key: its routes, and
+// its peer-table entry. Safe to call concurrently with the running
+// data-plane loops. Reports an error if no such peer exists.
+func (e *Engine) RemovePeer(pubKey []byte) error {
+	peer, ok := e.peerTable.RemovePeer(pubKey)
+	if !ok {
+		return fmt.Errorf("peer %x not found", pubKey)
+	}
+	e.routingTable.RemoveRoutesForPeer(peer)
+	return nil
+}
+
+// EnableMeshHub marks this Engine as hub/relay-capable: it may forward data
+// packets between two of its peers (see the relay branch in udpToTun) and
+// send MESH_INTRO frames to introduce peers to each other. Safe to call at
+// any time, including concurrently with the running data-plane loops — it
+// only flips a flag the hot loop checks per packet.
+//
+// This is engine-only runtime plumbing, not a config-file/wire decision: how
+// a leaf client's config eventually declares "this peer is my mesh hub" is
+// an open question deferred to VEIL-MESH-1.md (config.go is intentionally
+// not touched here — see that doc's "deferred config-schema question"
+// section).
+func (e *Engine) EnableMeshHub() { e.isHub.Store(true) }
+
+// DisableMeshHub reverts EnableMeshHub. Exported mainly for tests and for any
+// future runtime role toggle; ordinary hub deployments just call
+// EnableMeshHub once at startup and leave it set.
+func (e *Engine) DisableMeshHub() { e.isHub.Store(false) }
+
+// IsHub reports whether this Engine currently acts as a mesh hub/relay.
+// Leaf-only engines (the common case) always return false, so the extra
+// relay-lookup branch in udpToTun is skipped entirely on their hot path.
+func (e *Engine) IsHub() bool { return e.isHub.Load() }
+
+// Run launches the data-plane goroutines. It returns immediately; a fatal
+// loop error is reported on errChan, and a caller-initiated shutdown goes
+// through Close/Wait. ctx additionally lets the caller tie the engine's
+// lifetime to a broader shutdown context; Close works either way.
+func (e *Engine) Run(ctx context.Context, errChan chan error) {
+	e.ctx, e.cancel = context.WithCancel(ctx)
+	e.wg.Add(3)
+	go func() { defer e.wg.Done(); e.maintenanceLoop() }()
+	go func() { defer e.wg.Done(); e.tunToUDP(errChan) }()
+	go func() { defer e.wg.Done(); e.udpToTun(errChan) }()
+}
+
+// Close signals the data-plane loops to stop. It is idempotent and does not
+// block — call Wait to block until every loop has actually exited. Close
+// does not close the tun device or UDP socket (Engine doesn't own them); the
+// caller must still close those itself to unblock tunToUDP/udpToTun's
+// in-flight reads, which do not otherwise observe cancellation.
+func (e *Engine) Close() {
+	e.closeOnce.Do(func() {
+		if e.cancel != nil {
+			e.cancel()
+		}
+	})
+}
+
+// Wait blocks until all goroutines launched by Run have exited. Call after
+// Close (and after the caller has closed tun/conn, if a prompt stop of
+// blocking reads is needed).
+func (e *Engine) Wait() {
+	e.wg.Wait()
 }
 
 func (e *Engine) maintenanceLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		now := time.Now()
 		for _, peer := range e.peerTable.GetAllPeers() {
 			peer.ExpirePrevious(now)
@@ -288,12 +430,12 @@ func (e *Engine) maintenanceLoop() {
 				// silent: we're still sending keepalives but nothing has come
 				// back for watchdogTimeout, so the session is a black hole and
 				// waiting out rekeyAfterTime (~30 min) would strand the client.
-				silent := tunnelSilent(cur, peer.LastRecv(), now)
+				silent := tunnelSilent(cur, peer.LastRecv(), now, peer.keepaliveOverride)
 				need := cur == nil || cur.age(now) > rekeyAfterTime || silent
 				if need {
 					if _, lastInit := peer.Pending(); now.Sub(lastInit) >= rekeyTimeout {
 						if silent {
-							log.Printf("Peer %x silent for >%s, forcing handshake", peer.PublicKey[:4], watchdogTimeout)
+							log.Printf("Peer %x silent for >%s, forcing handshake", peer.PublicKey[:4], effectiveWatchdogTimeout(peer.keepaliveOverride))
 						}
 						e.startInitiatorHandshake(peer, now)
 					}
@@ -305,7 +447,7 @@ func (e *Engine) maintenanceLoop() {
 			// new session promptly).
 			sendSess := peer.SendSession()
 			if sendSess != nil && ep != nil && sendSess.age(now) <= rejectAfterTime {
-				if now.Sub(sendSess.lastSent()) >= keepaliveInterval() {
+				if now.Sub(sendSess.lastSent()) >= keepaliveInterval(peer) {
 					if err := sendOnSession(e.conn, ep, peer.LocalIP(), peer, sendSess, nil); err != nil {
 						log.Printf("keepalive send error: %v", err)
 					}
@@ -437,10 +579,22 @@ func (e *Engine) tunToUDP(errChan chan error) {
 	lastSentReport := time.Now()
 
 	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		default:
+		}
 		readStart := time.Now()
 		n, err := e.tun.ReadBatch(readBufs, sizes, 0)
 		readDur := time.Since(readStart)
 		if err != nil {
+			select {
+			case <-e.ctx.Done():
+				// Expected: Close() was called and the caller closed the tun
+				// device to unblock this read. Not a fatal error.
+				return
+			default:
+			}
 			errChan <- fmt.Errorf("tun read error: %w", err)
 			return
 		}
@@ -523,8 +677,21 @@ func (e *Engine) udpToTun(errChan chan error) {
 	lastReport := time.Now()
 
 	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		default:
+		}
 		n, err := e.conn.readBatch(bufs, sizes, remotes, locals)
 		if err != nil {
+			select {
+			case <-e.ctx.Done():
+				// Expected: Close() was called and the caller closed the UDP
+				// socket to unblock this read (typically surfacing as
+				// net.ErrClosed below). Not a fatal error.
+				return
+			default:
+			}
 			// Transient receive errors (most notably the ICMP-unreachable
 			// induced WSAECONNRESET on Windows) must not kill the tunnel:
 			// dropping the loop here turns one stray ICMP into total loss.
@@ -624,6 +791,9 @@ func (e *Engine) udpToTun(errChan chan error) {
 				case string(probeAckMagic[:]):
 					handleMTUProbeAck(decapsulated, j.peer)
 					continue
+				case string(meshIntroMagic[:]):
+					e.handleMeshIntro(decapsulated)
+					continue
 				}
 			}
 
@@ -631,6 +801,21 @@ func (e *Engine) udpToTun(errChan chan error) {
 			if !ok {
 				continue // keepalive or incomplete fragment
 			}
+
+			// Hub relay fallback (VEIL-MESH-1.md §5): if this packet's
+			// destination belongs to a *different* connected peer rather than
+			// this engine's own TUN, forward it there instead of delivering
+			// locally. Gated to hub-role engines so a leaf's hot path carries
+			// no forwarding logic at all beyond this one cheap IsHub() check.
+			if e.IsHub() {
+				if dstIP := ExtractDstIP(inner); dstIP != nil {
+					if target := e.routingTable.Lookup(dstIP); target != nil && target != j.peer {
+						e.relayToPeer(target, inner)
+						continue
+					}
+				}
+			}
+
 			if full == nil {
 				// The decrypted packet sits tagLen bytes into the UDP read
 				// buffer, which doubles as the batched TUN write headroom.
@@ -659,6 +844,7 @@ func (e *Engine) startInitiatorHandshake(peer *Peer, now time.Time) {
 		return
 	}
 	hm := core.NewHandshakeMachine(true, peer.kNet, peer.nid, peer.localPriv, peer.remotePub)
+	hm.PSK = peer.presharedKey
 	msg1, err := hm.ConstructMsg1(generateRandomPrefix())
 	if err != nil {
 		log.Printf("Failed to construct Msg1: %v", err)
@@ -710,7 +896,10 @@ func (e *Engine) handleHandshake(packet []byte, remote *net.UDPAddr, localIP net
 	}
 	peer := e.peerTable.GetPeer(payload.CPub[:])
 	if peer == nil {
-		log.Printf("Msg1 from unconfigured client key %x", payload.CPub[:4])
+		// Reachable by anyone who can pass the mac1 gate (i.e. knows K_net):
+		// a valid network member with a typo'd key, or K_net compromise. A
+		// rate limiter keeps that from becoming a log-flood vector.
+		unconfiguredPeerLog.Printf("Msg1 from unconfigured client key %x", payload.CPub[:4])
 		return
 	}
 	if !peer.CheckAndUpdateMsg1Timestamp(payload.Timestamp) {
@@ -727,6 +916,11 @@ func (e *Engine) handleHandshake(packet []byte, remote *net.UDPAddr, localIP net
 		log.Printf("nonce seed rng error: %v", err)
 		return
 	}
+	// The responder only learns which configured peer this is after
+	// ProcessMsg1 resolves payload.CPub above, so the PSK (a per-peer secret)
+	// can only be attached to the handshake machine here, just before
+	// ConstructMsg2 mixes it into the session KDF.
+	rhm.PSK = peer.presharedKey
 	params := &core.Msg2SessionParams{TagLen: 16, SessionNonceSeed: nonceSeed}
 	msg2, keys, err := rhm.ConstructMsg2(generateRandomPrefix(), params)
 	if err != nil {

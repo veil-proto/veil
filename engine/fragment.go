@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"sort"
 	"time"
 )
 
@@ -18,16 +19,69 @@ const (
 	fragmentHeaderLen     = 12
 	maxTransportPlaintext = maxOuterPayload - transportOverhead // 1418 = ceiling a peer's frame budget can probe up to
 	fragmentTTL           = 30 * time.Second
+
+	// maxConcurrentFragBuffers bounds how many distinct in-flight fragment
+	// sets one session will reassemble at once, so a burst of packets with
+	// many different (random) fragment IDs can't grow s.frags unboundedly
+	// between TTL sweeps. Each buffer is at most 65535 bytes (total is
+	// capped at a uint16), so this bounds worst-case reassembly memory to
+	// roughly maxConcurrentFragBuffers*64KiB per session.
+	maxConcurrentFragBuffers = 64
 )
 
 var fragmentMagic = [4]byte{'V', 'F', 'R', '1'}
 
+// fragRange is a half-open byte range [start,end) covered by one received
+// fragment chunk.
+type fragRange struct {
+	start, end uint16
+}
+
 type fragmentBuffer struct {
-	total    int
-	seen     map[uint16]uint16
-	received int
-	data     []byte
-	created  time.Time
+	total   int
+	ranges  []fragRange // sorted, non-overlapping; see insertRange
+	data    []byte
+	created time.Time
+}
+
+// insertRange attempts to add [start,end) to the buffer's coverage. It
+// returns false, leaving ranges unchanged, if [start,end) overlaps an
+// existing range without being an exact duplicate of it (spec 14.2: reject
+// overlapping fragments rather than letting one silently last-write-win over
+// another). An exact duplicate — the same range received twice, e.g. a
+// retransmit — is accepted as a no-op.
+func (buf *fragmentBuffer) insertRange(start, end uint16) bool {
+	for _, r := range buf.ranges {
+		if start == r.start && end == r.end {
+			return true
+		}
+		if start < r.end && r.start < end {
+			return false
+		}
+	}
+	buf.ranges = append(buf.ranges, fragRange{start, end})
+	sort.Slice(buf.ranges, func(i, j int) bool { return buf.ranges[i].start < buf.ranges[j].start })
+	return true
+}
+
+// covered reports whether the accumulated ranges fully cover [0,total) with
+// no gaps — true range-coverage completion, not a byte-count heuristic (a
+// byte count can be satisfied by overlapping/duplicate chunks that still
+// leave a gap elsewhere).
+func (buf *fragmentBuffer) covered() bool {
+	if len(buf.ranges) == 0 || buf.ranges[0].start != 0 {
+		return false
+	}
+	end := buf.ranges[0].end
+	for _, r := range buf.ranges[1:] {
+		if r.start > end {
+			return false
+		}
+		if r.end > end {
+			end = r.end
+		}
+	}
+	return end >= uint16(buf.total)
 }
 
 // makeTransportFrames splits inner into wire frames no larger than budget, the
@@ -100,9 +154,13 @@ func (s *Session) handleTransportFrame(frame []byte, now time.Time) (pkt, full [
 
 	buf := s.frags[id]
 	if buf == nil || buf.total != total {
+		if buf == nil && len(s.frags) >= maxConcurrentFragBuffers {
+			// Too many distinct in-flight fragment sets already; drop this
+			// fragment rather than let reassembly memory grow unboundedly.
+			return nil, nil, false
+		}
 		buf = &fragmentBuffer{
 			total: total,
-			seen:  make(map[uint16]uint16),
 			// tunWriteOffset headroom lets the reassembled packet go straight
 			// into a batched TUN write alongside unfragmented packets.
 			data:    make([]byte, tunWriteOffset+total),
@@ -111,12 +169,14 @@ func (s *Session) handleTransportFrame(frame []byte, now time.Time) (pkt, full [
 		s.frags[id] = buf
 	}
 
-	if _, dup := buf.seen[offset]; !dup {
-		copy(buf.data[tunWriteOffset+int(offset):], chunk)
-		buf.seen[offset] = uint16(len(chunk))
-		buf.received += len(chunk)
+	end := int(offset) + len(chunk)
+	if !buf.insertRange(offset, uint16(end)) {
+		// Overlaps a previously-accepted, non-identical range: reject this
+		// fragment instead of letting it silently corrupt the reassembly.
+		return nil, nil, false
 	}
-	if buf.received < buf.total {
+	copy(buf.data[tunWriteOffset+int(offset):], chunk)
+	if !buf.covered() {
 		return nil, nil, false
 	}
 

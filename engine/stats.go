@@ -42,7 +42,7 @@ func (e *Engine) Stats() []PeerStats {
 			s.LastHandshake = cur.establishedAt
 			// Connected: the session is confirmed and we've heard from the peer
 			// within the silent-tunnel watchdog window.
-			s.Connected = cur.isConfirmed() && !tunnelSilent(cur, p.LastRecv(), now)
+			s.Connected = cur.isConfirmed() && !tunnelSilent(cur, p.LastRecv(), now, p.keepaliveOverride)
 		}
 		out = append(out, s)
 	}
