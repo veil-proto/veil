@@ -1,0 +1,39 @@
+name: Prerelease
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prerelease:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+      - name: Build keygen binaries
+        run: |
+          VER=$(date +%y.%-m.%-d)
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w" \
+              -o "dist/veil-keygen-linux-$arch" ./cmd/veil-keygen
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+      - name: Publish rolling prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=$(date +%y.%-m.%-d)
+          gh release delete prerelease --yes --cleanup-tag 2>/dev/null || true
+          gh release create prerelease dist/* \
+            --prerelease \
+            --title "Prerelease $VER (${GITHUB_SHA::7})" \
+            --notes "Rolling prerelease from \`${GITHUB_SHA}\`. Contains veil-keygen for installer/client provisioning."
