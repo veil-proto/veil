@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"sort"
 	"time"
+
+	"github.com/veil-proto/veil/internal/ratelog"
 )
 
 const (
@@ -20,16 +22,34 @@ const (
 	maxTransportPlaintext = maxOuterPayload - transportOverhead // 1418 = ceiling a peer's frame budget can probe up to
 	fragmentTTL           = 30 * time.Second
 
-	// maxConcurrentFragBuffers bounds how many distinct in-flight fragment
-	// sets one session will reassemble at once, so a burst of packets with
-	// many different (random) fragment IDs can't grow s.frags unboundedly
-	// between TTL sweeps. Each buffer is at most 65535 bytes (total is
-	// capped at a uint16), so this bounds worst-case reassembly memory to
-	// roughly maxConcurrentFragBuffers*64KiB per session.
-	maxConcurrentFragBuffers = 64
+	// maxConcurrentFragBuffers is a backstop against a degenerate
+	// many-tiny-buffers case (lots of distinct fragment IDs each holding
+	// very little data). maxFragReassemblyBytes below is the primary limit
+	// in practice — a real high-throughput transfer (e.g. saturating a link
+	// during a speed test, over a full-tunnel 0.0.0.0/0 route) can easily
+	// have dozens of large packets fragmenting concurrently, one fragment
+	// set per oversized TUN read; this count exists only to bound memory
+	// under a flood of many *small* fragment sets, not to limit legitimate
+	// concurrency, so it's set high enough to not matter in the common case.
+	maxConcurrentFragBuffers = 4096
+
+	// maxFragReassemblyBytes bounds total in-flight reassembly memory per
+	// session across every concurrent fragment buffer (sum of each buffer's
+	// declared total). This is the limit that actually matters for
+	// legitimate traffic: it's sized to comfortably cover many concurrent
+	// large-packet reassemblies during a sustained high-throughput transfer,
+	// while still bounding worst-case memory from a hostile flood of
+	// many/large declared totals that never complete.
+	maxFragReassemblyBytes = 64 << 20 // 64 MiB
 )
 
 var fragmentMagic = [4]byte{'V', 'F', 'R', '1'}
+
+// fragCapLog rate-limits the "fragment reassembly cap reached" log line —
+// see ratelog's package doc for why any packet-triggered log line needs
+// this (an attacker, or just a saturated link, can otherwise generate this
+// line as fast as packets arrive).
+var fragCapLog = ratelog.NewLimiter(5 * time.Second)
 
 // fragRange is a half-open byte range [start,end) covered by one received
 // fragment chunk.
@@ -120,6 +140,19 @@ func makeTransportFrames(inner []byte, budget int) [][]byte {
 	return frames
 }
 
+// fragReassemblyBytes sums the declared total size of every in-flight
+// fragment buffer, i.e. the reassembly memory currently committed for this
+// session. Called only when opening a *new* fragment set (not per fragment
+// chunk), so its O(n) cost is bounded by how many distinct concurrent
+// fragment sets exist, not by total fragment volume.
+func fragReassemblyBytes(frags map[uint32]*fragmentBuffer) int {
+	total := 0
+	for _, b := range frags {
+		total += b.total
+	}
+	return total
+}
+
 // handleTransportFrame consumes one decrypted transport frame. For a complete
 // packet it returns (pkt, full, true): pkt is the inner IP packet, and full is
 // non-nil only for reassembled fragments, in which case it is a buffer holding
@@ -154,10 +187,15 @@ func (s *Session) handleTransportFrame(frame []byte, now time.Time) (pkt, full [
 
 	buf := s.frags[id]
 	if buf == nil || buf.total != total {
-		if buf == nil && len(s.frags) >= maxConcurrentFragBuffers {
-			// Too many distinct in-flight fragment sets already; drop this
-			// fragment rather than let reassembly memory grow unboundedly.
-			return nil, nil, false
+		if buf == nil {
+			if n := len(s.frags); n >= maxConcurrentFragBuffers {
+				fragCapLog.Printf("fragment reassembly buffer count cap reached (%d), dropping new fragment set", n)
+				return nil, nil, false
+			}
+			if inFlight := fragReassemblyBytes(s.frags); inFlight+total > maxFragReassemblyBytes {
+				fragCapLog.Printf("fragment reassembly byte cap reached (%d+%d > %d), dropping new fragment set", inFlight, total, maxFragReassemblyBytes)
+				return nil, nil, false
+			}
 		}
 		buf = &fragmentBuffer{
 			total: total,

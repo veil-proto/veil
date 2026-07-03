@@ -140,3 +140,86 @@ func TestFragment_ConcurrentBufferCapEnforced(t *testing.T) {
 		t.Fatalf("fragment buffer count %d exceeds cap %d", n, maxConcurrentFragBuffers)
 	}
 }
+
+// TestFragment_ByteCapEnforced verifies the primary limit in practice: total
+// declared reassembly bytes across all in-flight buffers, not raw buffer
+// count. Regression test for the bug where the old low buffer-count cap
+// (64) was exhausted within seconds by a real multi-flow transfer (e.g. a
+// speed test opening several parallel large downloads at once over a
+// full-tunnel route), silently dropping large packets with zero visible
+// symptom other than "throughput stalls" — see maxFragReassemblyBytes.
+func TestFragment_ByteCapEnforced(t *testing.T) {
+	s := &Session{}
+	now := time.Now()
+
+	// Each fragment set declares a near-max total (65535), so it doesn't
+	// take anywhere near maxConcurrentFragBuffers distinct sets to exceed
+	// maxFragReassemblyBytes — this is what actually happens under a real
+	// high-throughput transfer long before the buffer-count backstop would
+	// ever matter.
+	const total = 65535
+	opened := 0
+	for i := 0; i < maxConcurrentFragBuffers; i++ {
+		f := buildFragment(uint32(i), 0, total, bytes.Repeat([]byte{byte(i)}, 10))
+		s.handleTransportFrame(f, now)
+		s.fragMu.Lock()
+		_, exists := s.frags[uint32(i)]
+		s.fragMu.Unlock()
+		if !exists {
+			break
+		}
+		opened++
+	}
+
+	wantMaxOpened := maxFragReassemblyBytes/total + 1 // +1 for rounding slack
+	if opened > wantMaxOpened {
+		t.Fatalf("opened %d fragment sets of %d bytes each (%d total) before the byte cap kicked in; want at most ~%d", opened, total, opened*total, wantMaxOpened)
+	}
+	if opened == maxConcurrentFragBuffers {
+		t.Fatalf("byte cap never triggered even after opening the full buffer-count cap (%d sets of %d bytes = %d bytes, want cap at %d)", opened, total, opened*total, maxFragReassemblyBytes)
+	}
+
+	s.fragMu.Lock()
+	n := len(s.frags)
+	s.fragMu.Unlock()
+	if n != opened {
+		t.Fatalf("expected exactly %d buffers to have been admitted, found %d", opened, n)
+	}
+}
+
+// TestFragment_ManyConcurrentFlowsSucceedWithinByteCap verifies a burst of
+// many concurrent large-packet flows — the exact real-world pattern a speed
+// test's parallel connections produce over a full-tunnel route — all
+// reassemble successfully as long as they stay within maxFragReassemblyBytes,
+// which is sized with generous headroom for exactly this case (regression
+// guard for the old 64-buffer-count cap that this scenario blew through
+// almost immediately).
+func TestFragment_ManyConcurrentFlowsSucceedWithinByteCap(t *testing.T) {
+	s := &Session{}
+	now := time.Now()
+
+	const flows = 200 // far more than the old 64-buffer-count cap
+	const chunkSize = 500
+	const total = 4 * chunkSize // 2000 bytes per flow, well within the byte cap even at 200 flows (400000 bytes)
+
+	// Interleave: send chunk 0 of every flow, then chunk 1 of every flow,
+	// etc., so all 200 fragment sets are genuinely concurrent (open at once)
+	// rather than completing one at a time.
+	payload := bytes.Repeat([]byte{0xAB}, chunkSize)
+	for chunkIdx := 0; chunkIdx < total/chunkSize; chunkIdx++ {
+		for flow := 0; flow < flows; flow++ {
+			offset := uint16(chunkIdx * chunkSize)
+			f := buildFragment(uint32(flow), offset, total, payload)
+			if _, _, ok := s.handleTransportFrame(f, now); ok && chunkIdx != total/chunkSize-1 {
+				t.Fatalf("flow %d completed early after chunk %d", flow, chunkIdx)
+			}
+		}
+	}
+
+	s.fragMu.Lock()
+	remaining := len(s.frags)
+	s.fragMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expected all %d concurrent flows to complete and be cleared, %d still buffered (dropped by the cap)", flows, remaining)
+	}
+}
