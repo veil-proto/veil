@@ -131,17 +131,25 @@ func (e *Engine) probeSize(peer *Peer, size int) bool {
 		return false
 	}
 
-	inner := make([]byte, size)
-	copy(inner[:4], probeMagic[:])
-	binary.LittleEndian.PutUint16(inner[4:6], uint16(size))
+	// body is the fixed 6-byte probe marker (magic + requested size); the
+	// requested outer plaintext size is reached via padLen below, not by
+	// making body itself size bytes long. The previous version built inner as
+	// a full size-byte buffer and then computed
+	// padLen = size - frameOverhead - len(inner), which is always negative
+	// since len(inner) already equals size — probeSize always returned false
+	// and PMTU probing never worked at all (P0.4, VEIL-Combined-Roadmap.md).
+	var body [6]byte
+	copy(body[:4], probeMagic[:])
+	binary.LittleEndian.PutUint16(body[4:6], uint16(size))
+
+	padLen := size - frameOverhead - len(body)
+	if padLen < 0 {
+		return false
+	}
 
 	for attempt := 0; attempt <= probeRetries; attempt++ {
 		ch := peer.armProbe(size)
-		padLen := size - frameOverhead - len(inner)
-		if padLen < 0 {
-			return false
-		}
-		if err := sendControlOnSession(e.conn, sess, ep, localIP, inner, uint16(padLen)); err != nil {
+		if err := sendControlOnSession(e.conn, sess, ep, localIP, body[:], uint16(padLen)); err != nil {
 			return false
 		}
 		select {

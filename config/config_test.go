@@ -45,7 +45,8 @@ func TestLoadConfigString_NetSecretInsecureSentinel(t *testing.T) {
 	text := "[Interface]\n" +
 		"PrivateKey = " + validKeyHex() + "\n" +
 		"NID = " + validKeyHex() + "\n" +
-		"NetSecret = insecure\n"
+		"NetSecret = insecure\n" +
+		"AllowInsecureNetSecretForTestingOnly = true\n"
 	cfg, err := LoadConfigString(text)
 	if err != nil {
 		t.Fatalf("expected NetSecret = insecure to be accepted, got: %v", err)
@@ -53,8 +54,25 @@ func TestLoadConfigString_NetSecretInsecureSentinel(t *testing.T) {
 	if !cfg.Interface.NetSecretInsecure {
 		t.Fatal("expected NetSecretInsecure to be true")
 	}
+	if !cfg.Interface.AllowInsecureNetSecret {
+		t.Fatal("expected AllowInsecureNetSecret to be true")
+	}
 	if len(cfg.Interface.NetSecret) != 0 {
 		t.Fatal("expected NetSecret to be empty when insecure sentinel is used")
+	}
+}
+
+// TestLoadConfigString_NetSecretInsecureWithoutFlagRejected is a regression
+// test for P1.5 (VEIL-Combined-Roadmap.md): "NetSecret = insecure" alone used
+// to be a silently-accepted production footgun with no warning. It must now
+// require the differently-named AllowInsecureNetSecretForTestingOnly key too.
+func TestLoadConfigString_NetSecretInsecureWithoutFlagRejected(t *testing.T) {
+	text := "[Interface]\n" +
+		"PrivateKey = " + validKeyHex() + "\n" +
+		"NID = " + validKeyHex() + "\n" +
+		"NetSecret = insecure\n"
+	if _, err := LoadConfigString(text); err == nil {
+		t.Fatal("expected NetSecret = insecure without AllowInsecureNetSecretForTestingOnly to be rejected")
 	}
 }
 
@@ -176,7 +194,8 @@ func TestSerialize_InsecureSentinelRoundTrip(t *testing.T) {
 	text := "[Interface]\n" +
 		"PrivateKey = " + validKeyHex() + "\n" +
 		"NID = " + validKeyHex() + "\n" +
-		"NetSecret = insecure\n"
+		"NetSecret = insecure\n" +
+		"AllowInsecureNetSecretForTestingOnly = true\n"
 	cfg, err := LoadConfigString(text)
 	if err != nil {
 		t.Fatalf("load: %v", err)

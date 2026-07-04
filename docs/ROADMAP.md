@@ -1,8 +1,10 @@
 # VEIL Roadmap
 
 **Status:** living document, updated as phases close.
-**Last updated:** 2026-07-04 (Go data plane switched to `record/v1`; Phase 2
-GUI/mesh milestone-1 retained).
+**Last updated:** 2026-07-04 (Go data plane switched to `record/v1`; a
+follow-up hardening pass — §1b — then found and fixed several bugs in that
+switch itself, including one that broke all real traffic despite handshakes
+succeeding).
 **Scope:** all five repos — `veil` (protocol core), `veil-install`, `veil-linux`,
 `veil-windows`, `veil-windows-gui`.
 
@@ -28,7 +30,8 @@ deliberate decision.
 | `go build`/`go vet` (veil-windows, veil-windows-gui, cross-compiled) | green |
 | Phase 1 P0 fixes (§2 below) | **done** — config validation, PSK wired into KDF, fragment range-coverage, engine lifecycle + dynamic AddPeer/RemovePeer, PersistentKeepalive wired in, rate-limited hostile-input logging, DH zero-output abort, secret zeroization |
 | Handshake | 2-message WireGuard-Noise-style, Elligator2-encoded ephemerals — **not** the target's TLV/canonical + ML-KEM hybrid scheme |
-| Wire record | Go engine uses `record/v1`: `route_token[16] || seq_protected[8] || AEAD`, v1 inner frames, bounded route-token window, RFC-6479 replay commit after AEAD success. `transport/v0` remains as a legacy package/test reference, not the runtime data plane. |
+| Wire record | Go engine uses `record/v1`: `route_token[16] || seq_protected[8] || AEAD`, v1 inner frames, bounded route-token window, RFC-6479 replay commit after AEAD success. `transport/v0` remains as a legacy package/test reference, not the runtime data plane. See §1b: the initial `record/v1` switch shipped with a bug that silently dropped all real (unfragmented) traffic; now fixed. |
+| Handshake hardening (§1b) | **done** — Msg1 two-stage static-key proof (closes a forgeable-timestamp DoS), variable prefix removed, `NetSecret=insecure` now gated behind an explicit flag + startup warning, corrected secret zeroization scope |
 | PQ / kmod / XDP | PQ reference code exists in `pq/` using Go's ML-KEM-768 primitives. kmod/XDP not started; no C/kernel code exists anywhere in any of the 5 repos. |
 | Mesh | Phase 2 milestone-1 **done**: `VEIL-MESH-1.md` design doc, `MESH_INTRO` frame, bounded UDP hole-punch, hub relay fallback gated to `Engine.IsHub()`, all unit-tested. Deferred: full ICE/TURN, multi-hop relay, route gossip, the leaf-side "trusted introducer" hardening noted in `VEIL-MESH-1.md` §3.2, and the config-schema question (§9 below, §7 of the doc) |
 | GUI | Phase 2 **done**: resizable window, real log streaming (`CmdLogs` + ring buffer), structured Split Tunnel tab with Allowed/Disallowed CIDR editing (client-side subtraction), `config.Serialize()` added to support it. Raw `.conf` editor kept as "Advanced" (§10 below) |
@@ -46,6 +49,95 @@ deliberate decision.
   `watchdog_test.go`, `fuzz_test.go`). Adding a dedicated throughput/latency
   benchmark harness is still deferred; add it before any kmod/XDP split so the
   Go and kernel data planes can be compared against the same traffic profile.
+
+## 1b. record/v1 hardening pass (done)
+
+The `record/v1` switch (§4 below) replaced the transport layer's framing and
+route-token scheme in one large change. A follow-up audit (cross-checked
+against `VEIL-Combined-Roadmap.md`, `MTU.md`, `VEIL-ADR-HIERARCHY.md`, then
+independently re-verified against the actual post-switch source, since some
+of that audit's claims described files/functions that turned out not to
+match this repo's state at the time they were written) found the switch
+itself had shipped with several bugs, one of which broke all real traffic:
+
+1. **All unfragmented traffic silently dropped despite working handshakes
+   (found via live testing, not the audit)** — `engine/engine.go`'s
+   `tunToUDP` and `engine/mesh.go`'s `relayToPeer` still had a raw-passthrough
+   fast path for packets at or under budget
+   (`out.appendFrame(sess, packet, ...)`/`transportSend(..., inner)`, bypassing
+   `makeTransportFrames` entirely) left over from before the `record/v1`
+   switch. Every inner plaintext must be a `recordv1.Frame` — the receiver's
+   `handleRecordFrame` always calls `recordv1.ParseFrame` on it — so a raw,
+   unwrapped IP packet's own header bytes (version/IHL, ToS, total length)
+   get misread as a frame header and fail to parse; the packet is silently
+   dropped as malformed. Only packets large enough to need fragmenting (which
+   already routed through `makeTransportFrames`) ever survived. This is
+   exactly "handshake succeeds, no site loads": the UDP-level handshake
+   doesn't touch this path at all, but essentially every real IP packet
+   (TCP SYN/ACKs, small HTTP requests, DNS queries) does. Fixed by routing
+   every packet through `makeTransportFrames` unconditionally, matching
+   `sendOnSession`, which already did this correctly.
+2. **Decrypted plaintext no longer lands back in the UDP read buffer** —
+   `record/v1/record.go`'s `Open` decrypts via `aead.Open(nil, ...)`, which
+   allocates a fresh buffer, unlike the old `transport.DecapsulateTransport`,
+   which opened in place (`aead.Open(ciphertext[:0], ...)`) so the plaintext
+   landed back inside the UDP read buffer at a fixed offset. `udpToTun`'s
+   `full == nil` fast path still assumed the old in-place behavior and just
+   resliced the (still-encrypted) UDP read buffer — handing `WriteBatch`
+   stale ciphertext bytes instead of the real decrypted packet for every
+   unfragmented data frame. Fixed by explicitly copying the decrypted bytes
+   into the write buffer instead of aliasing.
+3. **PMTU probing permanently broken** — `engine/pmtu.go`'s `probeSize` built
+   `inner := make([]byte, size)` (so `len(inner) == size`) and then computed
+   `padLen := size - frameOverhead - len(inner)`, which is `-frameOverhead`
+   — always negative — so every probe returned false immediately and every
+   peer was stuck at `floorPlaintext` forever. Fixed by building a fixed
+   6-byte probe marker and padding it out to the requested size instead of
+   conflating the two.
+4. **Msg1 static-key proof (P0.3)** — ported from a separate P0 pass done in
+   parallel against a stale local checkout (`core/handshake_machine.go`,
+   untouched by the `record/v1` switch): the old single-ciphertext Msg1
+   allowed an attacker who knew only a victim's *public* key to forge a
+   timestamp-advancing Msg1 and permanently jam that victim's future
+   handshakes (`Peer.CheckAndUpdateMsg1Timestamp`). Msg1 is now two
+   independently-keyed AEAD stages; no peer lookup or state mutation is
+   reachable until the stage requiring the claimed identity's real private
+   key succeeds. See `core/msg1_forge_test.go`.
+5. **Handshake prefix removed (P0.6)** — the 0/4/8/12/16-byte random prefix
+   made every inbound Msg1/Msg2 do up to 5 MAC computations for no wire-size
+   benefit `padHandshake`'s length-bucket padding wasn't already providing.
+   Removing it required changing `ProcessMsg1`/`ProcessMsg2`'s length checks
+   from exact equality to a minimum (`padHandshake` still pads the wire
+   message past the natural length — a regression caught by the E2E test in
+   (7) below, not the audit).
+6. **Replay-window O(delta) DoS, found in two places** — `record/v1/replay.go`'s
+   `Commit` (the live path) and, separately in a not-yet-reconciled parallel
+   pass, `transport/recvwindow.go`'s `Commit` (currently unused dead code
+   after the `record/v1` switch, fixed anyway for hygiene) both cleared their
+   anti-replay bitmap in a loop bounded by the sequence delta, so an
+   authenticated packet with a huge sequence number could hang the receiver.
+   Both bounded to the fixed bitmap width now.
+7. **`NetSecret = insecure` production footgun** — now requires
+   `AllowInsecureNetSecretForTestingOnly = true` and logs a loud warning at
+   `Engine.New()`.
+8. **Corrected secret zeroization scope** — the audit's proposed fix ("zero
+   `hm.KNet` and `hm.PSK`") would have zeroed shared references into
+   long-lived config state, corrupting every future handshake. Only the
+   genuine per-handshake ephemeral secret (`HandshakeMachine.LocalEPriv`) is
+   zeroed, via `HandshakeMachine.ZeroSecrets()` called from
+   `engine/peer.go`'s `Promote`/`SetPending`.
+9. **New regression coverage**: `engine/e2e_data_test.go`'s
+   `TestEngineDataPlaneEndToEnd_UnfragmentedPacketSurvivesTunWrite` drives two
+   real `Engine`s over real loopback UDP through a full handshake and one
+   unfragmented data packet, asserting the receiving side's TUN gets the
+   exact original bytes. This is the test that would have caught bugs (1)
+   and (2) — the existing `integration_test.go` helper (`deliver`) calls
+   `handleRecordFrame` directly and never exercises `udpToTun`'s actual hot
+   loop, which is exactly where both bugs lived.
+
+**Downstream impact:** wire-breaking (Msg1/Msg2 layout) on top of the
+already-wire-breaking `record/v1` switch — every repo needs the new `veil`
+commit before interop works. No config-schema changes.
 
 ## 2. Phase 1 — P0 correctness fixes (done)
 

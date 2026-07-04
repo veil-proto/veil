@@ -27,9 +27,15 @@ type InterfaceConfig struct {
 	// explicit, deliberate opt-out of the per-network pre-DH gate, never an
 	// implicit default. See Validate().
 	NetSecretInsecure bool
-	Padding           string
-	DNS               string // comma-separated DNS servers set inside the tunnel (client)
-	FwMark            int
+	// AllowInsecureNetSecret must also be set (AllowInsecureNetSecretForTestingOnly
+	// in the config file) for NetSecretInsecure to pass Validate(). Requiring a
+	// second, differently-named key makes "insecure" alone insufficient to run
+	// in production by accident — a deployer has to explicitly type out
+	// "ForTestingOnly" to enable it. See Validate().
+	AllowInsecureNetSecret bool
+	Padding                string
+	DNS                    string // comma-separated DNS servers set inside the tunnel (client)
+	FwMark                 int
 }
 
 type PeerConfig struct {
@@ -77,6 +83,9 @@ func (c *Config) Serialize() string {
 	}
 	if c.Interface.NetSecretInsecure {
 		b.WriteString("NetSecret = insecure\n")
+		if c.Interface.AllowInsecureNetSecret {
+			b.WriteString("AllowInsecureNetSecretForTestingOnly = true\n")
+		}
 	} else if len(c.Interface.NetSecret) > 0 {
 		fmt.Fprintf(&b, "NetSecret = %s\n", hex.EncodeToString(c.Interface.NetSecret))
 	}
@@ -166,6 +175,7 @@ func loadFrom(source any) (*Config, error) {
 	} else if parsedConfig.Interface.NetSecret, err = parseHex(netSecHex); err != nil {
 		return nil, fmt.Errorf("invalid NetSecret: %v", err)
 	}
+	parsedConfig.Interface.AllowInsecureNetSecret, _ = ifaceSec.Key("AllowInsecureNetSecretForTestingOnly").Bool()
 
 	parsedConfig.Interface.Padding = ifaceSec.Key("Padding").String()
 	parsedConfig.Interface.DNS = ifaceSec.Key("DNS").String()
@@ -261,6 +271,9 @@ func (c *Config) Validate() error {
 	if c.Interface.NetSecretInsecure {
 		if len(c.Interface.NetSecret) != 0 {
 			add("Interface.NetSecret cannot be set when NetSecret = insecure is also used")
+		}
+		if !c.Interface.AllowInsecureNetSecret {
+			add("NetSecret = insecure requires AllowInsecureNetSecretForTestingOnly = true in [Interface] — this is a dev/test-only opt-out of the network membership gate, never a production default")
 		}
 	} else if len(c.Interface.NetSecret) != 32 {
 		add("Interface.NetSecret must be exactly 32 bytes, or explicitly set to \"insecure\" to opt out (got %d bytes)", len(c.Interface.NetSecret))

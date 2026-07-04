@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"testing"
+	"time"
 )
 
 func testKeys() *TransportKeys {
@@ -94,6 +95,38 @@ func TestRecvWindowTooOld(t *testing.T) {
 	}
 	if rw.PreCheck(20000 - replayBits) {
 		t.Fatal("PreCheck must also reject too-old packets")
+	}
+}
+
+// TestRecvWindowCommitLargeJumpIsO1 is a regression guard for the P1.3 bug:
+// Commit used to clear the bitmap word-by-bit in a loop bounded by the
+// sequence delta (`for i := maxSeen+1; i <= n; i++`), so an authenticated
+// packet (mac1/AEAD already verified) carrying a huge sequence number, e.g.
+// near math.MaxUint64, could pin the receiver in a multi-second/never-ending
+// loop. Commit's cost must depend only on the fixed bitmap width, not on the
+// attacker-chosen sequence value.
+func TestRecvWindowCommitLargeJumpIsO1(t *testing.T) {
+	keys := testKeys()
+	table := NewTagTable()
+	peer := "peer1"
+	rw := newTestWindow(table, peer, keys)
+
+	if !rw.Commit(10) {
+		t.Fatal("accept 10")
+	}
+
+	start := time.Now()
+	if !rw.Commit(^uint64(0) - 1) {
+		t.Fatal("accept huge forward jump")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Commit with a huge sequence jump took %v, want O(1)", elapsed)
+	}
+
+	// The window has slid all the way to the new maxSeen; the old packet
+	// number is now unconditionally too old.
+	if rw.Commit(10) {
+		t.Fatal("old packet number must be rejected as too-old after the jump")
 	}
 }
 

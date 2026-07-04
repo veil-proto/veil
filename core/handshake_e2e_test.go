@@ -35,24 +35,22 @@ func TestHandshakeEndToEnd(t *testing.T) {
 	spub, _ := curve25519.X25519(sPriv[:], curve25519.Basepoint)
 	copy(sPub[:], spub)
 
-	prefixes := []int{0, 4, 8, 12, 16}
-
 	// Initiator knows the responder static public key.
 	initiator := NewHandshakeMachine(true, kNet, nid, cPriv, sPub)
 	// Responder knows K_net/NID and its own key; it learns C_pub from Msg1.
 	responder := NewHandshakeMachine(false, kNet, nid, sPriv, [32]byte{})
 
 	// Msg1
-	msg1, err := initiator.ConstructMsg1([]byte{0xAA, 0xBB, 0xCC, 0xDD}) // 4-byte prefix
+	msg1, err := initiator.ConstructMsg1()
 	if err != nil {
 		t.Fatalf("ConstructMsg1: %v", err)
 	}
-	payload, _, err := responder.ProcessMsg1(msg1, prefixes)
+	_, err = responder.ProcessMsg1(msg1)
 	if err != nil {
 		t.Fatalf("ProcessMsg1: %v", err)
 	}
-	if !bytes.Equal(payload.CPub[:], cPub[:]) {
-		t.Fatalf("responder recovered wrong C_pub\n got=%x\nwant=%x", payload.CPub, cPub)
+	if !bytes.Equal(responder.RemotePub[:], cPub[:]) {
+		t.Fatalf("responder recovered wrong C_pub\n got=%x\nwant=%x", responder.RemotePub, cPub)
 	}
 
 	// Msg2
@@ -61,11 +59,11 @@ func TestHandshakeEndToEnd(t *testing.T) {
 		seed[i] = byte(i + 1)
 	}
 	params := &Msg2SessionParams{TagLen: 16, SessionNonceSeed: seed}
-	msg2, srvKeys, err := responder.ConstructMsg2([]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}, params)
+	msg2, srvKeys, err := responder.ConstructMsg2(params)
 	if err != nil {
 		t.Fatalf("ConstructMsg2: %v", err)
 	}
-	_, cliKeys, _, err := initiator.ProcessMsg2(msg2, prefixes)
+	_, cliKeys, err := initiator.ProcessMsg2(msg2)
 	if err != nil {
 		t.Fatalf("ProcessMsg2: %v", err)
 	}

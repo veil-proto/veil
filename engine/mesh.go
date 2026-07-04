@@ -330,20 +330,22 @@ func (e *Engine) attemptHolePunch(peer *Peer, window time.Duration) {
 // relayToPeer forwards an already-decrypted inner packet to target,
 // re-encrypting it under target's own session. Used only by the hub relay
 // branch in udpToTun (VEIL-MESH-1.md §5.3), gated to IsHub() by the caller.
+// relayToPeer forwards an already-decrypted inner packet to target,
+// re-encrypting it under target's own session. Used only by the hub relay
+// branch in udpToTun (VEIL-MESH-1.md §5.3), gated to IsHub() by the caller.
+//
+// P0.2 (VEIL-Combined-Roadmap.md): this used to have its own raw-passthrough
+// fast path for inner packets at or under budget — the same bug as P0.1 in
+// tunToUDP (see engine.go). Routing every relayed packet through
+// makeTransportFrames, exactly like the direct-send path, means there is
+// exactly one encoder for transport plaintext, used everywhere it's produced.
 func (e *Engine) relayToPeer(target *Peer, inner []byte) {
 	sess := target.SendSession()
 	ep, localIP := target.Path()
 	if sess == nil || ep == nil {
 		return // target not reachable yet — silent drop, same as a routing miss
 	}
-	budget := target.FrameBudget()
-	if len(inner) <= budget {
-		if err := transportSend(e.conn, sess, ep, localIP, inner); err != nil {
-			log.Printf("mesh relay send error: %v", err)
-		}
-		return
-	}
-	for _, frame := range makeTransportFrames(inner, budget) {
+	for _, frame := range makeTransportFrames(inner, target.FrameBudget()) {
 		if err := transportSend(e.conn, sess, ep, localIP, frame); err != nil {
 			log.Printf("mesh relay send error: %v", err)
 			return

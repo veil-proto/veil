@@ -33,17 +33,15 @@ func pskHandshakeRaw(t *testing.T, initiatorPSK, responderPSK []byte) (cli, srv 
 	spub, _ := curve25519.X25519(sPriv[:], curve25519.Basepoint)
 	copy(sPub[:], spub)
 
-	prefixes := []int{0, 4, 8, 12, 16}
-
 	initiator := NewHandshakeMachine(true, kNet, nid, cPriv, sPub)
 	initiator.PSK = initiatorPSK
 	responder := NewHandshakeMachine(false, kNet, nid, sPriv, [32]byte{})
 
-	msg1, err := initiator.ConstructMsg1(nil)
+	msg1, err := initiator.ConstructMsg1()
 	if err != nil {
 		return nil, nil, err
 	}
-	if _, _, err = responder.ProcessMsg1(msg1, prefixes); err != nil {
+	if _, err = responder.ProcessMsg1(msg1); err != nil {
 		return nil, nil, err
 	}
 	responder.PSK = responderPSK
@@ -53,11 +51,11 @@ func pskHandshakeRaw(t *testing.T, initiatorPSK, responderPSK []byte) (cli, srv 
 		seed[i] = byte(i + 1)
 	}
 	params := &Msg2SessionParams{TagLen: 16, SessionNonceSeed: seed}
-	msg2, srvKeys, err := responder.ConstructMsg2(nil, params)
+	msg2, srvKeys, err := responder.ConstructMsg2(params)
 	if err != nil {
 		return nil, nil, err
 	}
-	_, cliKeys, _, err := initiator.ProcessMsg2(msg2, prefixes)
+	_, cliKeys, err := initiator.ProcessMsg2(msg2)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -184,7 +184,10 @@ func (p *Peer) Promote(sess *Session, confirmed bool) {
 	}
 	p.previous = p.current
 	p.current = sess
-	p.pendingHM = nil
+	if p.pendingHM != nil {
+		p.pendingHM.ZeroSecrets()
+		p.pendingHM = nil
+	}
 }
 
 // SendSession returns the session data should be sent on: the current session
@@ -206,6 +209,12 @@ func (p *Peer) SendSession() *Session {
 func (p *Peer) SetPending(hm *core.HandshakeMachine, now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.pendingHM != nil && p.pendingHM != hm {
+		// A new handshake attempt superseded one that never completed (e.g. a
+		// rekey retry) — zero the abandoned machine's ephemeral secret rather
+		// than just dropping the reference and waiting on GC.
+		p.pendingHM.ZeroSecrets()
+	}
 	p.pendingHM = hm
 	p.lastInit = now
 }

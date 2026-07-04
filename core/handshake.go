@@ -38,14 +38,41 @@ func HKDFBlake2s(secret, salt, info []byte, outLen int) ([]byte, error) {
 	return out, nil
 }
 
-// Msg1Payload previously carried an 8-byte PskID field. Nothing ever consumed
-// it (the PSK, when configured, is a single fixed per-peer secret known to
-// both sides out of band — there is no multi-PSK selection to hint at), so it
-// was dead ceremonial wire surface. Removed in favor of Reserved to keep the
-// wire size and all downstream offset math in ConstructMsg1/ProcessMsg1
-// unchanged.
-type Msg1Payload struct {
-	CPub                    [32]byte
+// Msg1 is now split across two separately-encrypted payloads (P0.3,
+// VEIL-Combined-Roadmap.md): Msg1StaticPayload (the claimed initiator static
+// public key, encrypted under a key only an ephemeral-static DH term
+// requires) and Msg1AuthPayload (timestamp/nonce/params, encrypted under a
+// key that requires the claimed static private key — see
+// HandshakeMachine.ProcessMsg1's doc comment for why this ordering matters).
+// Splitting them means the responder cannot even decrypt the timestamp,
+// let alone act on it, without the sender having proven static-key
+// possession first.
+
+// Msg1StaticPayload carries only the initiator's claimed static public key.
+type Msg1StaticPayload struct {
+	CPub [32]byte
+}
+
+func (m *Msg1StaticPayload) Encode() []byte {
+	out := make([]byte, 32)
+	copy(out, m.CPub[:])
+	return out
+}
+
+func DecodeMsg1StaticPayload(data []byte) (*Msg1StaticPayload, error) {
+	if len(data) != 32 {
+		return nil, errors.New("invalid Msg1StaticPayload size")
+	}
+	var m Msg1StaticPayload
+	copy(m.CPub[:], data)
+	return &m, nil
+}
+
+// Msg1AuthPayload carries everything that must not be trusted (in
+// particular, must not be allowed to mutate any peer state) until the sender
+// has proven possession of the static private key matching the pubkey
+// claimed in Msg1StaticPayload.
+type Msg1AuthPayload struct {
 	Timestamp               [12]byte
 	ClientNonce             [16]byte
 	RequestedTagLen         byte
@@ -53,28 +80,26 @@ type Msg1Payload struct {
 	Reserved                [22]byte
 }
 
-func (m *Msg1Payload) Encode() []byte {
-	out := make([]byte, 84)
-	copy(out[0:32], m.CPub[:])
-	copy(out[32:44], m.Timestamp[:])
-	copy(out[44:60], m.ClientNonce[:])
-	out[60] = m.RequestedTagLen
-	out[61] = m.RequestedPaddingProfile
-	copy(out[62:84], m.Reserved[:])
+func (m *Msg1AuthPayload) Encode() []byte {
+	out := make([]byte, 52)
+	copy(out[0:12], m.Timestamp[:])
+	copy(out[12:28], m.ClientNonce[:])
+	out[28] = m.RequestedTagLen
+	out[29] = m.RequestedPaddingProfile
+	copy(out[30:52], m.Reserved[:])
 	return out
 }
 
-func DecodeMsg1Payload(data []byte) (*Msg1Payload, error) {
-	if len(data) != 84 {
-		return nil, errors.New("invalid Msg1Payload size")
+func DecodeMsg1AuthPayload(data []byte) (*Msg1AuthPayload, error) {
+	if len(data) != 52 {
+		return nil, errors.New("invalid Msg1AuthPayload size")
 	}
-	var m Msg1Payload
-	copy(m.CPub[:], data[0:32])
-	copy(m.Timestamp[:], data[32:44])
-	copy(m.ClientNonce[:], data[44:60])
-	m.RequestedTagLen = data[60]
-	m.RequestedPaddingProfile = data[61]
-	copy(m.Reserved[:], data[62:84])
+	var m Msg1AuthPayload
+	copy(m.Timestamp[:], data[0:12])
+	copy(m.ClientNonce[:], data[12:28])
+	m.RequestedTagLen = data[28]
+	m.RequestedPaddingProfile = data[29]
+	copy(m.Reserved[:], data[30:52])
 	return &m, nil
 }
 

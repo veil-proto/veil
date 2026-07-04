@@ -4,8 +4,15 @@ import (
 	"golang.org/x/crypto/blake2s"
 )
 
+// Version bumped for the VEIL-v1 breaking wave (VEIL-ADR-HIERARCHY.md
+// ADR-004): mandatory frame_type/capsule transport framing, the two-stage
+// Msg1 static-key proof, and handshake prefix removal are all wire-breaking.
+// ADR-004 packages them into a single flag-day bump rather than staggering
+// compatibility shims — every deployment upgrades together. Bumping Version
+// also changes DeriveNID's output for every existing network name, which is
+// the point: v0 and v1 peers must not silently interoperate.
 const (
-	Version     = "veil-v0.2-lite"
+	Version     = "veil-v1"
 	CryptoSuite = "X25519-BLAKE2s-ChaCha20Poly1305"
 )
 

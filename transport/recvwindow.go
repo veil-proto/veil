@@ -124,14 +124,27 @@ func (rw *RecvWindow) Commit(n uint64) bool {
 	}
 
 	// Advance the replay bitmap, clearing bits for the newly-exposed range.
+	// Must be O(len(rw.replay)) (a fixed 128 words), never O(n-maxSeen): an
+	// authenticated packet (mac1/AEAD already passed) with an attacker-chosen
+	// huge sequence number, e.g. n = maxUint64-1, would otherwise spin a loop
+	// proportional to that attacker-controlled delta instead of the bitmap's
+	// fixed width.
 	if !rw.started || n > rw.maxSeen {
-		if !rw.started {
-			rw.started = true
-		}
-		for i := rw.maxSeen + 1; i <= n; i++ {
-			idx := (i / 64) % uint64(len(rw.replay))
-			if i%64 == 0 {
-				rw.replay[idx] = 0
+		firstCommit := !rw.started
+		rw.started = true
+		wordDelta := (n / 64) - (rw.maxSeen / 64)
+		if firstCommit || wordDelta >= uint64(len(rw.replay)) {
+			for i := range rw.replay {
+				rw.replay[i] = 0
+			}
+		} else {
+			// Clear only the words newly exposed by sliding the window forward,
+			// at most len(rw.replay) iterations regardless of how large the
+			// underlying sequence jump is.
+			word := (rw.maxSeen / 64) % uint64(len(rw.replay))
+			for i := uint64(0); i < wordDelta; i++ {
+				word = (word + 1) % uint64(len(rw.replay))
+				rw.replay[word] = 0
 			}
 		}
 		rw.maxSeen = n
@@ -148,11 +161,29 @@ func (rw *RecvWindow) Commit(n uint64) bool {
 	if rw.maxSeen > tagWindowPast {
 		desiredLo = rw.maxSeen - tagWindowPast
 	}
-	if rw.hi <= rw.maxSeen+tagWindowFuture-tagSlideBatch {
-		rw.install(rw.hi, desiredHi)
-	}
-	if desiredLo >= rw.lo+tagSlideBatch {
-		rw.evict(rw.lo, desiredLo)
+	if desiredLo >= rw.hi {
+		// The entire previously-installed window is now stale: a forward jump
+		// moved maxSeen past it completely. install(rw.hi, desiredHi) here
+		// would derive one BLAKE2s tag per packet number across the whole
+		// jump distance — attacker-controlled and unbounded (same O(delta)
+		// class of bug as the replay bitmap above, just in the tag table
+		// instead). Discard the stale window and reinstall a fresh one, which
+		// costs at most tagWindowFuture+tagWindowPast tag derivations
+		// regardless of how large the jump was.
+		for _, key := range rw.installed {
+			rw.table.removeKey(key)
+		}
+		rw.installed = make(map[uint64]tagKey)
+		rw.lo = desiredLo
+		rw.hi = desiredLo
+		rw.install(desiredLo, desiredHi)
+	} else {
+		if rw.hi <= rw.maxSeen+tagWindowFuture-tagSlideBatch {
+			rw.install(rw.hi, desiredHi)
+		}
+		if desiredLo >= rw.lo+tagSlideBatch {
+			rw.evict(rw.lo, desiredLo)
+		}
 	}
 	return true
 }

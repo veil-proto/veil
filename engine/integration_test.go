@@ -17,7 +17,6 @@ import (
 // responder transport keys.
 func runHandshake(t *testing.T, cPriv, sPriv [32]byte, kNet, nid []byte) (cli, srv *transport.TransportKeys) {
 	t.Helper()
-	prefixes := []int{0, 4, 8, 12, 16}
 	sPubB, _ := curve25519.X25519(sPriv[:], curve25519.Basepoint)
 	var sPub [32]byte
 	copy(sPub[:], sPubB)
@@ -25,21 +24,21 @@ func runHandshake(t *testing.T, cPriv, sPriv [32]byte, kNet, nid []byte) (cli, s
 	initiator := core.NewHandshakeMachine(true, kNet, nid, cPriv, sPub)
 	responder := core.NewHandshakeMachine(false, kNet, nid, sPriv, [32]byte{})
 
-	msg1, err := initiator.ConstructMsg1([]byte{1, 2, 3, 4})
+	msg1, err := initiator.ConstructMsg1()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := responder.ProcessMsg1(msg1, prefixes); err != nil {
+	if _, err := responder.ProcessMsg1(msg1); err != nil {
 		t.Fatal(err)
 	}
 	var seed [32]byte
 	seed[0] = 0x9
 	params := &core.Msg2SessionParams{TagLen: 16, SessionNonceSeed: seed}
-	msg2, srvKeys, err := responder.ConstructMsg2([]byte{5, 6, 7, 8}, params)
+	msg2, srvKeys, err := responder.ConstructMsg2(params)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, cliKeys, _, err := initiator.ProcessMsg2(msg2, prefixes)
+	_, cliKeys, err := initiator.ProcessMsg2(msg2)
 	if err != nil {
 		t.Fatal(err)
 	}

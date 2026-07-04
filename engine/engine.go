@@ -53,8 +53,6 @@ const (
 	udpReadBufSize = 4096
 )
 
-var handshakePrefixes = []int{0, 4, 8, 12, 16}
-
 // ---- peer table ----
 
 type PeerTable struct {
@@ -102,18 +100,6 @@ func (pt *PeerTable) GetAllPeers() []*Peer {
 }
 
 // ---- wire-image helpers (intrinsic padding) ----
-
-func generateRandomPrefix() []byte {
-	choices := []int{0, 4, 8, 12, 16}
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(choices))))
-	length := choices[n.Int64()]
-	if length == 0 {
-		return nil
-	}
-	b := make([]byte, length)
-	rand.Read(b)
-	return b
-}
 
 // Length-padding buckets shared by every VEIL packet type, so no single
 // message type has a distinct, identifiable size of its own.
@@ -316,6 +302,15 @@ type Engine struct {
 func New(cfg *config.Config, tunDev Tun, conn *net.UDPConn) (*Engine, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	if cfg.Interface.NetSecretInsecure {
+		log.Printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		log.Printf("!!! WARNING: NetSecret = insecure — the network membership   !!!")
+		log.Printf("!!! gate (K_net) is DISABLED. Every UDP client on the        !!!")
+		log.Printf("!!! internet can probe and flood this handshake endpoint.    !!!")
+		log.Printf("!!! This is a dev/test-only setting. Do not run it in        !!!")
+		log.Printf("!!! production.                                              !!!")
+		log.Printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 	}
 	e := &Engine{
 		cfg:          cfg,
@@ -662,14 +657,20 @@ func (e *Engine) tunToUDP(errChan chan error) {
 			if ep == nil || sess == nil || sess.age(now) > rejectAfterTime {
 				continue
 			}
-			if len(packet) <= budget {
-				out.appendFrame(sess, packet, ep, localIP)
+			// P0.1 (VEIL-Combined-Roadmap.md): every packet must go through
+			// makeTransportFrames' record/v1 Frame wrapping, no exceptions.
+			// This used to send small packets as bare, unwrapped bytes
+			// (`out.appendFrame(sess, packet, ...)`), which is exactly the
+			// "handshake succeeds, no traffic flows" bug: the receiver's
+			// handleRecordFrame always calls recordv1.ParseFrame on the
+			// decrypted plaintext, and a raw IP packet's first bytes (IP
+			// version/IHL, ToS, total length) don't form a valid frame
+			// header — ParseFrame fails, the packet is silently dropped as
+			// malformed, and only packets large enough to need fragmenting
+			// (which already went through makeTransportFrames) ever arrived.
+			for _, frame := range makeTransportFrames(packet, budget) {
+				out.appendFrame(sess, frame, ep, localIP)
 				sentCount++
-			} else {
-				for _, frame := range makeTransportFrames(packet, budget) {
-					out.appendFrame(sess, frame, ep, localIP)
-					sentCount++
-				}
 			}
 			peer.addTx(len(packet))
 			sess.markSent(now)
@@ -843,8 +844,24 @@ func (e *Engine) udpToTun(errChan chan error) {
 			}
 
 			if full == nil {
-				// The decrypted packet sits tagLen bytes into the UDP read
-				// buffer, which doubles as the batched TUN write headroom.
+				// recordv1.Open decrypts via aead.Open(nil, ...), which
+				// allocates a fresh buffer for the plaintext rather than
+				// reusing packet's backing array — unlike the old
+				// transport.DecapsulateTransport, which opened in place
+				// (aead.Open(ciphertext[:0], ...)) so the plaintext landed
+				// back inside the UDP read buffer at a fixed offset. This
+				// used to just reslice bufs[j.i] here assuming inner's bytes
+				// were already sitting at tunWriteOffset — after the
+				// record/v1 switch that assumption is false, so every
+				// unfragmented data packet handed itself to WriteBatch as
+				// stale/still-encrypted bytes from bufs[j.i] instead of the
+				// real decrypted packet (handshake succeeds; no actual
+				// traffic — e.g. no site loads — because every data packet
+				// reaching the TUN device is corrupted). bufs[j.i] is safe
+				// to write into here: it isn't reused until the next
+				// ReadBatch call, which happens after this iteration's
+				// WriteBatch flush below.
+				copy(bufs[j.i][tunWriteOffset:], inner)
 				full = bufs[j.i][:tunWriteOffset+len(inner)]
 			}
 			j.peer.addRx(len(inner))
@@ -871,7 +888,7 @@ func (e *Engine) startInitiatorHandshake(peer *Peer, now time.Time) {
 	}
 	hm := core.NewHandshakeMachine(true, peer.kNet, peer.nid, peer.localPriv, peer.remotePub)
 	hm.PSK = peer.presharedKey
-	msg1, err := hm.ConstructMsg1(generateRandomPrefix())
+	msg1, err := hm.ConstructMsg1()
 	if err != nil {
 		log.Printf("Failed to construct Msg1: %v", err)
 		return
@@ -893,7 +910,7 @@ func (e *Engine) handleHandshake(packet []byte, remote *net.UDPAddr, localIP net
 		if hm == nil || !hm.IsInitiator {
 			continue
 		}
-		if _, keys, _, err := hm.ProcessMsg2(packet, handshakePrefixes); err == nil {
+		if _, keys, err := hm.ProcessMsg2(packet); err == nil {
 			sess := establishSession(e.routeTokens, p, keys, true, now)
 			// The initiator holds the keys now, so the session is confirmed and
 			// safe to send on immediately.
@@ -914,18 +931,22 @@ func (e *Engine) handleHandshake(packet []byte, remote *net.UDPAddr, localIP net
 		}
 	}
 
-	// 2) Msg1 (we are the responder).
+	// 2) Msg1 (we are the responder). ProcessMsg1 only returns successfully
+	// once the sender has proven possession of the static private key
+	// matching its claimed identity (see ProcessMsg1's doc comment, P0.3) —
+	// rhm.RemotePub is that now-trustworthy claimed key, safe to look up and
+	// act on below.
 	rhm := core.NewHandshakeMachine(false, e.cfg.Interface.NetSecret, e.cfg.Interface.NID, e.localPriv, [32]byte{})
-	payload, _, err := rhm.ProcessMsg1(packet, handshakePrefixes)
+	payload, err := rhm.ProcessMsg1(packet)
 	if err != nil {
 		return
 	}
-	peer := e.peerTable.GetPeer(payload.CPub[:])
+	peer := e.peerTable.GetPeer(rhm.RemotePub[:])
 	if peer == nil {
 		// Reachable by anyone who can pass the mac1 gate (i.e. knows K_net):
 		// a valid network member with a typo'd key, or K_net compromise. A
 		// rate limiter keeps that from becoming a log-flood vector.
-		unconfiguredPeerLog.Printf("Msg1 from unconfigured client key %x", payload.CPub[:4])
+		unconfiguredPeerLog.Printf("Msg1 from unconfigured client key %x", rhm.RemotePub[:4])
 		return
 	}
 	if !peer.CheckAndUpdateMsg1Timestamp(payload.Timestamp) {
@@ -948,7 +969,7 @@ func (e *Engine) handleHandshake(packet []byte, remote *net.UDPAddr, localIP net
 	// ConstructMsg2 mixes it into the session KDF.
 	rhm.PSK = peer.presharedKey
 	params := &core.Msg2SessionParams{TagLen: 16, SessionNonceSeed: nonceSeed}
-	msg2, keys, err := rhm.ConstructMsg2(generateRandomPrefix(), params)
+	msg2, keys, err := rhm.ConstructMsg2(params)
 	if err != nil {
 		log.Printf("ConstructMsg2 error: %v", err)
 		return

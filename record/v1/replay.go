@@ -21,6 +21,13 @@ func (rw *ReplayWindow) PreCheck(seq uint64) bool {
 	return !rw.isReplay(seq)
 }
 
+// Commit marks seq as seen. Cost is bounded by len(rw.replay) (a fixed 128
+// words), never by seq itself: the previous version cleared the bitmap in a
+// loop bounded by the sequence delta (`for i := maxSeen+1; i <= seq; i++`),
+// so an authenticated packet (route-token lookup + AEAD already verified)
+// carrying an attacker-chosen huge sequence number — e.g. seq near
+// math.MaxUint64 — could pin the receiver in a near-unbounded loop (P1.3,
+// VEIL-Combined-Roadmap.md).
 func (rw *ReplayWindow) Commit(seq uint64) bool {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
@@ -28,13 +35,18 @@ func (rw *ReplayWindow) Commit(seq uint64) bool {
 		return false
 	}
 	if !rw.started || seq > rw.maxSeen {
-		if !rw.started {
-			rw.started = true
-		}
-		for i := rw.maxSeen + 1; i <= seq; i++ {
-			idx := (i / 64) % uint64(len(rw.replay))
-			if i%64 == 0 {
-				rw.replay[idx] = 0
+		firstCommit := !rw.started
+		rw.started = true
+		wordDelta := (seq / 64) - (rw.maxSeen / 64)
+		if firstCommit || wordDelta >= uint64(len(rw.replay)) {
+			for i := range rw.replay {
+				rw.replay[i] = 0
+			}
+		} else {
+			word := (rw.maxSeen / 64) % uint64(len(rw.replay))
+			for i := uint64(0); i < wordDelta; i++ {
+				word = (word + 1) % uint64(len(rw.replay))
+				rw.replay[word] = 0
 			}
 		}
 		rw.maxSeen = seq
